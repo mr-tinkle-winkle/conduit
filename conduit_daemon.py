@@ -74,6 +74,7 @@ import json
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "conduit"
@@ -380,12 +381,20 @@ def main():
     ensure_config_exists()
     print("conduit-daemon: starting, watching", STATE_FILE, flush=True)
     while True:
-        state = load_state()
-        dump = pw_dump()
-        if dump:
-            nodes = build_graph(dump)
-            enforce_defaults(nodes)
-            reconcile(state, nodes, dump)
+        try:
+            state = load_state()
+            print(f"conduit-daemon: loaded state: {json.dumps(state)}", flush=True)
+            dump = pw_dump()
+            print(f"conduit-daemon: pw-dump returned {len(dump)} objects", flush=True)
+            if dump:
+                nodes = build_graph(dump)
+                enforce_defaults(nodes)
+                reconcile(state, nodes, dump)
+        except Exception:
+            # Belt-and-suspenders: a silently-dying loop is much harder to
+            # debug than a noisy one. Print the full traceback and keep
+            # going rather than letting one bad cycle kill the service.
+            traceback.print_exc()
         time.sleep(POLL_INTERVAL)
 
 
