@@ -98,6 +98,12 @@ in
     # media.class alone decides whether a given instance behaves as a
     # sink or as a source.
     #
+    # This has to go through services.pipewire.extraConfig.pipewire
+    # (real Nix attrs, which nixpkgs serializes into a drop-in file
+    # under /etc/pipewire/pipewire.conf.d/ itself) rather than writing
+    # environment.etc."pipewire/..." directly -- recent nixpkgs added
+    # an assertion that blocks the latter.
+    #
     # conduit_virtual_speaker: media.class = Audio/Sink. A plain null
     # sink -- apps play into it, and its monitor ports (which pw-dump
     # reports as this same node's output ports) are what the daemon
@@ -110,30 +116,32 @@ in
     # media class is Audio/Source/Virtual it shows up as a normal,
     # selectable recording device in Discord/OBS/etc. No separate
     # loopback pair needed.
-    environment.etc."pipewire/pipewire.conf.d/10-conduit-virtual-devices.conf".text = ''
-      context.objects = [
-          {   factory = adapter
-              args = {
-                  factory.name            = support.null-audio-sink
-                  node.name               = "conduit_virtual_speaker"
-                  node.description        = "Conduit Virtual Speaker"
-                  media.class             = "Audio/Sink"
-                  audio.position          = "FL,FR"
-                  monitor.channel-volumes = true
-              }
-          }
-          {   factory = adapter
-              args = {
-                  factory.name            = support.null-audio-sink
-                  node.name               = "conduit_virtual_mic"
-                  node.description        = "Conduit Virtual Mic"
-                  media.class             = "Audio/Source/Virtual"
-                  audio.position          = "FL,FR"
-                  monitor.channel-volumes = true
-              }
-          }
-      ]
-    '';
+    services.pipewire.extraConfig.pipewire."10-conduit-virtual-devices" = {
+      "context.objects" = [
+        {
+          factory = "adapter";
+          args = {
+            "factory.name" = "support.null-audio-sink";
+            "node.name" = "conduit_virtual_speaker";
+            "node.description" = "Conduit Virtual Speaker";
+            "media.class" = "Audio/Sink";
+            "audio.position" = [ "FL" "FR" ];
+            "monitor.channel-volumes" = true;
+          };
+        }
+        {
+          factory = "adapter";
+          args = {
+            "factory.name" = "support.null-audio-sink";
+            "node.name" = "conduit_virtual_mic";
+            "node.description" = "Conduit Virtual Mic";
+            "media.class" = "Audio/Source/Virtual";
+            "audio.position" = [ "FL" "FR" ];
+            "monitor.channel-volumes" = true;
+          };
+        }
+      ];
+    };
 
     # Ship both scripts declaratively, same as Puppetry -- the GUI
     # imports the daemon module at runtime, so both need to land
