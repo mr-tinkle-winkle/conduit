@@ -124,7 +124,14 @@ def pw_dump():
             ["pw-dump"], capture_output=True, text=True, timeout=10, check=True
         ).stdout
         return json.loads(out)
-    except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
+    except FileNotFoundError:
+        print("conduit-daemon: pw-dump not found on PATH", flush=True)
+        return []
+    except subprocess.CalledProcessError as e:
+        print(f"conduit-daemon: pw-dump failed (exit {e.returncode}): {e.stderr.strip()}", flush=True)
+        return []
+    except (subprocess.SubprocessError, json.JSONDecodeError) as e:
+        print(f"conduit-daemon: pw-dump error: {e}", flush=True)
         return []
 
 
@@ -209,6 +216,22 @@ def find_node(nodes, label, allowed_classes):
     return None
 
 
+def find_node_verbose(nodes, label, allowed_classes, context):
+    """Same as find_node, but logs a hint when a label from state.json
+    doesn't match anything currently in the graph -- the single most
+    common cause of "it's configured but nothing happens"."""
+    node = find_node(nodes, label, allowed_classes)
+    if node is None:
+        candidates = sorted(
+            n.display_label for n in nodes.values()
+            if n.media_class in allowed_classes and not n.is_ours
+        )
+        print(f"conduit-daemon: [{context}] no live node matches "
+              f"{label!r} (looked in {sorted(allowed_classes)}); "
+              f"currently eligible: {candidates}", flush=True)
+    return node
+
+
 def find_virtual(nodes, name):
     for node in nodes.values():
         if node.name == name:
@@ -234,13 +257,17 @@ def pair_ports(src_ports, dst_ports):
 # ---------------------------------------------------------------------------
 
 def pw_link(src_port, dst_port):
-    subprocess.run(["pw-link", str(src_port), str(dst_port)],
-                    capture_output=True)  # already-linked errors are fine to ignore
+    result = subprocess.run(["pw-link", str(src_port), str(dst_port)], capture_output=True, text=True)
+    stderr = result.stderr.strip()
+    if result.returncode != 0 and "already linked" not in stderr.lower() and "file exists" not in stderr.lower():
+        print(f"conduit-daemon: pw-link {src_port} {dst_port} failed: {stderr}", flush=True)
+    else:
+        print(f"conduit-daemon: linked {src_port} -> {dst_port}", flush=True)
 
 
 def pw_unlink(src_port, dst_port):
-    subprocess.run(["pw-link", "-d", str(src_port), str(dst_port)],
-                    capture_output=True)
+    result = subprocess.run(["pw-link", "-d", str(src_port), str(dst_port)], capture_output=True, text=True)
+    print(f"conduit-daemon: unlinked {src_port} -> {dst_port}", flush=True)
 
 
 def compute_desired_links(state, nodes):
@@ -267,10 +294,10 @@ def compute_desired_links(state, nodes):
     # a source) -- see module.nix for why one node covers both roles.
     if virtual_mic:
         for label in state["mic"]["inputs"]:
-            real_mic = find_node(nodes, label, {HW_SOURCE})
+            real_mic = find_node_verbose(nodes, label, {HW_SOURCE}, "mic input")
             route(real_mic, virtual_mic)
         for label in state["mic"]["outputs"]:
-            app = find_node(nodes, label, {APP_INPUT, HW_SINK})
+            app = find_node_verbose(nodes, label, {APP_INPUT, HW_SINK}, "mic output")
             route(virtual_mic, app)
 
     # --- Speaker side ---
@@ -279,10 +306,10 @@ def compute_desired_links(state, nodes):
         for label in state["speaker"]["inputs"]:
             if label in bypass_set:
                 continue  # bypass always wins over inputs
-            app = find_node(nodes, label, {APP_OUTPUT, HW_SOURCE})
+            app = find_node_verbose(nodes, label, {APP_OUTPUT, HW_SOURCE}, "speaker input")
             route(app, virtual_speaker)
         for label in state["speaker"]["outputs"]:
-            real_speaker = find_node(nodes, label, {HW_SINK})
+            real_speaker = find_node_verbose(nodes, label, {HW_SINK}, "speaker output")
             if real_speaker is None or virtual_speaker is None:
                 continue
             for pair in pair_ports(virtual_speaker.output_ports, real_speaker.input_ports):
@@ -295,9 +322,12 @@ def compute_desired_links(state, nodes):
 
     # --- Bypass: force-disconnect from virtual speaker, connect direct ---
     bypass_target_label = state["speaker"].get("bypass_target")
-    bypass_target = find_node(nodes, bypass_target_label, {HW_SINK}) if bypass_target_label else None
+    bypass_target = (
+        find_node_verbose(nodes, bypass_target_label, {HW_SINK}, "bypass target")
+        if bypass_target_label else None
+    )
     for label in bypass_set:
-        app = find_node(nodes, label, {APP_OUTPUT})
+        app = find_node_verbose(nodes, label, {APP_OUTPUT}, "bypass app")
         if app is None:
             continue
         # Always mark (app -> virtual_speaker) as managed so any existing
