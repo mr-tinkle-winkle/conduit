@@ -176,10 +176,10 @@ def build_graph(dump):
                 continue
             port_id = obj["id"]
             channel = props.get("audio.channel", "MONO")
-            direction = obj.get("info", {}).get("direction") or props.get("port.direction")
-            if direction == "out":
+            direction = obj.get("info", {}).get("direction") or props.get("port.direction") or ""
+            if direction.startswith("out"):
                 node.output_ports.append((port_id, channel))
-            elif direction == "in":
+            elif direction.startswith("in"):
                 node.input_ports.append((port_id, channel))
 
     return nodes
@@ -380,6 +380,7 @@ def enforce_defaults(nodes):
 def main():
     ensure_config_exists()
     print("conduit-daemon: starting, watching", STATE_FILE, flush=True)
+    printed_debug_sample = False
     while True:
         try:
             state = load_state()
@@ -387,7 +388,22 @@ def main():
             dump = pw_dump()
             print(f"conduit-daemon: pw-dump returned {len(dump)} objects", flush=True)
             if dump:
+                if not printed_debug_sample:
+                    # One-time raw sample so we can confirm the actual JSON
+                    # shape pw-dump produces on this PipeWire version,
+                    # instead of assuming it matches the docs.
+                    sample_node = next((o for o in dump if o.get("type") == "PipeWire:Interface:Node"), None)
+                    sample_ports = [o for o in dump if o.get("type") == "PipeWire:Interface:Port"][:2]
+                    print("conduit-daemon: SAMPLE NODE: " + json.dumps(sample_node), flush=True)
+                    for p in sample_ports:
+                        print("conduit-daemon: SAMPLE PORT: " + json.dumps(p), flush=True)
+                    printed_debug_sample = True
+
                 nodes = build_graph(dump)
+                total_out = sum(len(n.output_ports) for n in nodes.values())
+                total_in = sum(len(n.input_ports) for n in nodes.values())
+                print(f"conduit-daemon: built graph: {len(nodes)} nodes, "
+                      f"{total_out} output ports, {total_in} input ports", flush=True)
                 enforce_defaults(nodes)
                 reconcile(state, nodes, dump)
         except Exception:
