@@ -66,27 +66,28 @@ def current_nodes():
 
 
 # ---------------------------------------------------------------------------
-# Auto-Detect: a small popup (opened via the up-arrow button on each
-# section) letting you combine any of three strategies for sweeping in
-# devices you didn't explicitly add. See conduit_daemon.expand_auto_detect
-# for exactly how each one matches.
+# Auto-Detect: a small popup (opened via the "^" button on each device row)
+# letting you combine any of three strategies for sweeping in devices you
+# didn't explicitly add. Scoped to that one device, not the whole list --
+# see conduit_daemon.expand_item_auto_detect for exactly how each strategy
+# matches.
 # ---------------------------------------------------------------------------
 
 DEFAULT_AUTO_DETECT = {"prefix": False, "keyword": False, "keyword_text": "", "same_app": False}
 
 
 class AutoDetectPopup(QWidget):
-    def __init__(self, config, on_apply, anchor_widget):
+    def __init__(self, label, config, on_apply, anchor_widget):
         super().__init__(anchor_widget, Qt.Popup)
         self._on_apply = on_apply
         self.setContentsMargins(0, 0, 0, 0)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.addWidget(QLabel("<b>Auto-Detect</b>"))
+        layout.addWidget(QLabel(f"<b>Auto-Detect for {label}</b>"))
 
         self.prefix_cb = QCheckBox("Prefix match")
-        self.prefix_cb.setToolTip('"Chromium input-2" counts as the same device as a saved "Chromium input"')
+        self.prefix_cb.setToolTip(f'A device like "{label}-2" or "{label} (2)" counts as the same as this one')
         self.prefix_cb.setChecked(config.get("prefix", False))
         layout.addWidget(self.prefix_cb)
 
@@ -100,7 +101,7 @@ class AutoDetectPopup(QWidget):
         self.keyword_edit.setEnabled(self.keyword_cb.isChecked())
 
         self.same_app_cb = QCheckBox("Same source app")
-        self.same_app_cb.setToolTip("Groups every stream created by the same running app/process, "
+        self.same_app_cb.setToolTip("Groups every stream created by the same running app/process as this device, "
                                      "however differently each one is named")
         self.same_app_cb.setChecked(config.get("same_app", False))
         layout.addWidget(self.same_app_cb)
@@ -129,8 +130,15 @@ class AutoDetectPopup(QWidget):
         })
 
 
+def _auto_detect_is_active(config):
+    return bool(config.get("prefix") or config.get("keyword") or config.get("same_app"))
+
+
 # ---------------------------------------------------------------------------
-# A labeled "dropdown adds to a removable list" widget.
+# A labeled "dropdown adds to a removable list" widget. Each row carries
+# its own auto-detect config (via the "^" button), since a list often
+# mixes real hardware with an app-created virtual device and a single
+# list-wide setting would wrongly apply to both.
 # ---------------------------------------------------------------------------
 
 class AddListSection(QWidget):
@@ -138,19 +146,11 @@ class AddListSection(QWidget):
         super().__init__(parent)
         self._on_change = on_change
         self._eligible = []
-        self._auto_detect = dict(DEFAULT_AUTO_DETECT)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        header = QHBoxLayout()
-        header.addWidget(QLabel(f"<b>{title}</b>"))
-        header.addStretch()
-        self.auto_detect_btn = QPushButton("\u25B2 Auto-Detect")
-        self.auto_detect_btn.setFlat(True)
-        self.auto_detect_btn.clicked.connect(self._open_auto_detect_popup)
-        header.addWidget(self.auto_detect_btn)
-        layout.addLayout(header)
+        layout.addWidget(QLabel(f"<b>{title}</b>"))
 
         self.combo = QComboBox()
         self.combo.addItem(PLACEHOLDER)
@@ -161,35 +161,14 @@ class AddListSection(QWidget):
         self.list_widget.setMaximumHeight(110)
         layout.addWidget(self.list_widget)
 
-    def _open_auto_detect_popup(self):
-        popup = AutoDetectPopup(self._auto_detect, self._apply_auto_detect, self.auto_detect_btn)
-        popup.move(self.auto_detect_btn.mapToGlobal(QPoint(0, -popup.sizeHint().height())))
-        popup.show()
-
-    def _apply_auto_detect(self, config):
-        self._auto_detect = config
-        self._update_auto_detect_label()
-        self._on_change()
-
-    def get_auto_detect(self):
-        return dict(self._auto_detect)
-
-    def set_auto_detect(self, config):
-        self._auto_detect = {**DEFAULT_AUTO_DETECT, **(config or {})}
-        self._update_auto_detect_label()
-
-    def _update_auto_detect_label(self):
-        active = self._auto_detect["prefix"] or self._auto_detect["keyword"] or self._auto_detect["same_app"]
-        self.auto_detect_btn.setText("\u25B2 Auto-Detect \u2713" if active else "\u25B2 Auto-Detect")
-
     def set_eligible(self, labels):
         self._eligible = labels
-        current_items = self.items()
+        current_labels = self.item_labels()
         self.combo.blockSignals(True)
         self.combo.clear()
         self.combo.addItem(PLACEHOLDER)
         for label in labels:
-            if label not in current_items:  # already-added items don't need re-offering
+            if label not in current_labels:  # already-added items don't need re-offering
                 self.combo.addItem(label)
         self.combo.blockSignals(False)
 
@@ -198,45 +177,82 @@ class AddListSection(QWidget):
             return
         label = self.combo.currentText()
         self.combo.setCurrentIndex(0)
-        if label in self.items():
+        if label in self.item_labels():
             return
         self._add_row(label)
         self._on_change()
 
-    def _add_row(self, label):
+    def _add_row(self, label, auto_detect=None):
+        auto_detect = {**DEFAULT_AUTO_DETECT, **(auto_detect or {})}
         item = QListWidgetItem(self.list_widget)
+        item.setData(Qt.UserRole, auto_detect)
+
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(4, 2, 4, 2)
         row_layout.addWidget(QLabel(label))
         row_layout.addStretch()
+
+        auto_detect_btn = QPushButton()
+        auto_detect_btn.setFixedWidth(28)
+        auto_detect_btn.setFlat(True)
+        auto_detect_btn.setToolTip("Auto-Detect")
+        self._refresh_auto_detect_button(auto_detect_btn, auto_detect)
+        auto_detect_btn.clicked.connect(lambda: self._open_auto_detect_popup(item, auto_detect_btn, label))
+        row_layout.addWidget(auto_detect_btn)
+
         remove_btn = QPushButton("\u2715")
         remove_btn.setFixedWidth(24)
         remove_btn.setFlat(True)
         remove_btn.clicked.connect(lambda: self._remove_row(item))
         row_layout.addWidget(remove_btn)
+
         item.setSizeHint(row.sizeHint())
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(item, row)
+
+    def _refresh_auto_detect_button(self, btn, auto_detect):
+        btn.setText("^\u2713" if _auto_detect_is_active(auto_detect) else "^")
+
+    def _open_auto_detect_popup(self, item, btn, label):
+        current = item.data(Qt.UserRole) or dict(DEFAULT_AUTO_DETECT)
+
+        def apply(config):
+            item.setData(Qt.UserRole, config)
+            self._refresh_auto_detect_button(btn, config)
+            self._on_change()
+
+        popup = AutoDetectPopup(label, current, apply, btn)
+        popup.move(btn.mapToGlobal(QPoint(0, -popup.sizeHint().height())))
+        popup.show()
 
     def _remove_row(self, item):
         row_index = self.list_widget.row(item)
         self.list_widget.takeItem(row_index)
         self._on_change()
 
+    def item_labels(self):
+        """Just the labels -- used for dropdown de-duplication."""
+        return [entry["label"] for entry in self.items()]
+
     def items(self):
+        """Return [{"label": ..., "auto_detect": {...}}, ...] in display order."""
         result = []
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             widget = self.list_widget.itemWidget(item)
             label = widget.layout().itemAt(0).widget().text()
-            result.append(label)
+            auto_detect = item.data(Qt.UserRole) or dict(DEFAULT_AUTO_DETECT)
+            result.append({"label": label, "auto_detect": auto_detect})
         return result
 
-    def set_items(self, labels):
+    def set_items(self, entries):
         self.list_widget.clear()
-        for label in labels:
-            self._add_row(label)
+        for entry in entries:
+            if isinstance(entry, str):
+                self._add_row(entry)
+            else:
+                self._add_row(entry["label"], entry.get("auto_detect"))
 
 
 # ---------------------------------------------------------------------------
@@ -358,28 +374,23 @@ class ConduitWindow(QMainWindow):
     def load_state(self):
         cd.ensure_config_exists()
         state = cd.load_state()
-        self.mic_inputs.set_items(state["mic"]["inputs"]["items"])
-        self.mic_inputs.set_auto_detect(state["mic"]["inputs"]["auto_detect"])
-        self.mic_outputs.set_items(state["mic"]["outputs"]["items"])
-        self.mic_outputs.set_auto_detect(state["mic"]["outputs"]["auto_detect"])
-        self.speaker_inputs.set_items(state["speaker"]["inputs"]["items"])
-        self.speaker_inputs.set_auto_detect(state["speaker"]["inputs"]["auto_detect"])
-        self.speaker_outputs.set_items(state["speaker"]["outputs"]["items"])
-        self.speaker_outputs.set_auto_detect(state["speaker"]["outputs"]["auto_detect"])
-        self.speaker_bypass.set_items(state["speaker"]["bypass"]["items"])
-        self.speaker_bypass.set_auto_detect(state["speaker"]["bypass"]["auto_detect"])
+        self.mic_inputs.set_items(state["mic"]["inputs"])
+        self.mic_outputs.set_items(state["mic"]["outputs"])
+        self.speaker_inputs.set_items(state["speaker"]["inputs"])
+        self.speaker_outputs.set_items(state["speaker"]["outputs"])
+        self.speaker_bypass.set_items(state["speaker"]["bypass"])
         self.speakers_target.set_value(state["speaker"].get("bypass_target"))
 
     def _current_state(self):
         return {
             "mic": {
-                "inputs": {"items": self.mic_inputs.items(), "auto_detect": self.mic_inputs.get_auto_detect()},
-                "outputs": {"items": self.mic_outputs.items(), "auto_detect": self.mic_outputs.get_auto_detect()},
+                "inputs": self.mic_inputs.items(),
+                "outputs": self.mic_outputs.items(),
             },
             "speaker": {
-                "inputs": {"items": self.speaker_inputs.items(), "auto_detect": self.speaker_inputs.get_auto_detect()},
-                "outputs": {"items": self.speaker_outputs.items(), "auto_detect": self.speaker_outputs.get_auto_detect()},
-                "bypass": {"items": self.speaker_bypass.items(), "auto_detect": self.speaker_bypass.get_auto_detect()},
+                "inputs": self.speaker_inputs.items(),
+                "outputs": self.speaker_outputs.items(),
+                "bypass": self.speaker_bypass.items(),
                 "bypass_target": self.speakers_target.value(),
             },
         }

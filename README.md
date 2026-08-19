@@ -1,5 +1,7 @@
 # Conduit
 
+<img src="assets/conduit_logo.png" width="120" alt="Conduit logo" />
+
 A PipeWire virtual mic/speaker router for NixOS, with a Qt editor. Two
 virtual devices — **Conduit Virtual Speaker** and **Conduit Virtual
 Mic** — get created system-wide and set as your defaults. You then
@@ -90,6 +92,31 @@ Two panels: **Speaker** on the left, **Microphone** on the right.
   the virtual speaker entirely, forced instead onto whatever's chosen
   in the **Speakers** dropdown right below it (a single-device picker,
   not a list).
+- **Speaker → Output** and **Bypass target (Speakers)** aren't limited
+  to physical hardware -- an app that wants to consume your mix (e.g.
+  Discord's screen-share audio capture) is fair game for Output too.
+  The Speakers picker specifically stays hardware-only, since that's
+  "your speakers" in the bypass sense.
+- **Every device row has a small `^` button** that opens a popup with
+  three combinable Auto-Detect strategies for sweeping in devices you
+  didn't explicitly add. It's per-device, not per-list, since a list
+  often mixes real hardware (which never needs this) with an
+  app-created virtual device (which might):
+  - *Prefix match* -- treats "Chromium input-2" as the same device as
+    a saved "Chromium input" (strips a trailing counter/suffix before
+    comparing).
+  - *Keyword match* -- matches anything whose name contains the text
+    you type, e.g. "vencord".
+  - *Same source app* -- groups every stream created by the same
+    running app/process, however differently each one is named. Only
+    kicks in while the device this row was saved as is currently live,
+    since that's what supplies the reference to expand from.
+
+  This is built for things like Discord/Vesktop, which spin up a
+  differently-named capture stream per screen share. Matches are
+  purely a routing-time decision -- they never get written back into
+  the visible list, so the GUI keeps showing only what you explicitly
+  added even as auto-detected devices come and go.
 - Nothing needs an explicit "Save" — every change writes
   `state.json` immediately and restarts the daemon (debounced by
   ~600ms so rapid changes don't thrash it).
@@ -116,6 +143,24 @@ Check the daemon's logs:
 ```fish
 journalctl --user -u conduit-daemon -f
 ```
+
+Each time the daemon (re)starts it logs a one-time inventory of every
+node PipeWire currently knows about, including port counts -- if a
+device isn't showing up in Conduit's dropdowns, grep for it there:
+
+```fish
+journalctl --user -u conduit-daemon -n 300 --no-pager | grep -i vencord
+```
+
+`in_ports=0 out_ports=0` on a device means it genuinely has no usable
+ports at that moment (e.g. queried before or after the app that owns
+it finished setting it up) -- restart the daemon while the device is
+actually active and check again.
+
+If `nixos-rebuild` fails on a fresh clone with an error about
+`environment.etc."pipewire<...>"` no longer being supported, you're on
+an older copy of this repo from before that got fixed -- `git pull`
+and rebuild again.
 
 Check the virtual devices exist:
 
@@ -154,20 +199,30 @@ changes:
 ```json
 {
   "mic": {
-    "inputs": ["Blue Yeti Analog Stereo"],
+    "inputs": [
+      {"label": "Blue Yeti Analog Stereo", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false}}
+    ],
     "outputs": []
   },
   "speaker": {
     "inputs": [],
-    "outputs": ["Analog Stereo Speakers"],
-    "bypass": ["Spotify"],
+    "outputs": [
+      {"label": "Analog Stereo Speakers", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false}},
+      {"label": "vencord-screen-share", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": true}}
+    ],
+    "bypass": [
+      {"label": "Spotify", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false}}
+    ],
     "bypass_target": "Analog Stereo Speakers"
   }
 }
 ```
 
 Devices are matched by their `node.description` (stable across boots
-for the same hardware); apps are matched by `application.name`.
+for the same hardware); apps are matched by `application.name`. Older
+configs from earlier Conduit versions (a flat list of strings, or a
+short-lived list-wide auto-detect format) are migrated automatically
+on next load -- no manual edits needed.
 
 ## Repo layout
 

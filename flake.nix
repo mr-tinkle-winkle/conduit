@@ -28,11 +28,12 @@
           pname = "conduit";
           version = "1.0";
           dontUnpack = true;
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.imagemagick ];
           installPhase =
             let
               guiPython = pkgs.python3.withPackages (ps: [ ps.pyside6 ]);
               qtPluginPath = "${pkgs.qt6.qtbase}/lib/qt-6/plugins";
+              iconSizes = [ 16 24 32 48 64 128 256 ];
             in
             ''
               mkdir -p $out/bin $out/share/conduit
@@ -44,6 +45,12 @@
                 --set QT_PLUGIN_PATH "${qtPluginPath}" \
                 --set QT_QPA_PLATFORM_PLUGIN_PATH "${qtPluginPath}/platforms" \
                 --prefix PATH : "${pkgs.pipewire}/bin:${pkgs.wireplumber}/bin"
+
+              ${pkgs.lib.concatMapStringsSep "\n" (sz: ''
+                mkdir -p $out/share/icons/hicolor/${toString sz}x${toString sz}/apps
+                convert ${./assets/conduit_logo.png} -resize ${toString sz}x${toString sz} \
+                  $out/share/icons/hicolor/${toString sz}x${toString sz}/apps/conduit.png
+              '') iconSizes}
             '';
         };
       };

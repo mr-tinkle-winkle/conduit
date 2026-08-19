@@ -52,13 +52,14 @@ CONFIG LAYOUT
 
   {
     "mic": {
-      "inputs":  {"items": ["Blue Yeti Analog Stereo"], "auto_detect": {...}},
-      "outputs": {"items": [], "auto_detect": {...}}
+      "inputs":  [{"label": "Blue Yeti Analog Stereo", "auto_detect": {...}}],
+      "outputs": []
     },
     "speaker": {
-      "inputs":  {"items": ["Spotify"], "auto_detect": {...}},
-      "outputs": {"items": ["Family 17h (HDMI)"], "auto_detect": {...}},
-      "bypass":  {"items": ["Spotify"], "auto_detect": {...}},
+      "inputs":  [{"label": "Spotify", "auto_detect": {...}}],
+      "outputs": [{"label": "Family 17h (HDMI)", "auto_detect": {...}},
+                  {"label": "vencord-screen-share", "auto_detect": {...}}],
+      "bypass":  [{"label": "Spotify", "auto_detect": {...}}],
       "bypass_target": "Family 17h (HDMI)"
     }
   }
@@ -71,32 +72,41 @@ for that one app.
 
 AUTO-DETECT
 -----------
-Each list's "auto_detect" is:
+Each entry in a list carries its own "auto_detect":
 
   {"prefix": bool, "keyword": bool, "keyword_text": str, "same_app": bool}
 
-"items" are what you explicitly picked in the GUI -- the templates.
-When any auto_detect strategy is on, every reconcile cycle also routes
-any *currently live* device that matches one of the enabled strategies
-relative to an item, without writing it back into "items". This is
-deliberately ephemeral: state.json (and the GUI's visible list) always
-reflects only what you explicitly added, and matched devices come and
-go from routing as PipeWire's graph changes, which is exactly what you
-want for something like Discord spinning up a differently-numbered
-capture stream per screen share.
+This is deliberately per-device rather than per-list -- a list often
+mixes real hardware (which never needs this) with an app-created
+virtual device (which might), and a single list-wide setting would
+apply prefix/keyword/same-app matching to entries that have nothing to
+do with each other. Every reconcile cycle, each entry's *own* label is
+always routed, and if any of its strategies are on, any other
+currently-live device matching that strategy *relative to that one
+entry* gets swept in too -- without ever being written back into the
+config. This is deliberately ephemeral: state.json (and the GUI's
+visible list) always reflects only what you explicitly added, and
+auto-detected siblings come and go from routing as PipeWire's graph
+changes, which is exactly what you want for something like Discord
+spinning up a differently-numbered capture stream per screen share.
 
   - prefix:   strip a trailing counter/suffix ("-2", " (3)", "#4", ...)
-              from both the item and the candidate's label, and match
+              from both this entry's label and a candidate's, and match
               if what's left is identical. Catches "Chromium input-2"
               off of a saved "Chromium input".
   - keyword:  substring match (case-insensitive) against keyword_text,
-              independent of any saved item.
+              independent of this entry's own label.
   - same_app: match by the underlying PipeWire client (client.id) --
               catches every stream a single running app/process
               creates, however differently each one is named. Only
-              works while at least one node whose label exactly
-              matches a saved item is currently live, since that's
-              what supplies the reference client.id to expand from.
+              works while a node whose label exactly matches this
+              entry is currently live, since that's what supplies the
+              reference client.id to expand from. Matching is by
+              client identity, not by which list entry supplied the
+              seed -- if that client also owns some other stream you
+              didn't expect, same_app will sweep it in too, since as
+              far as PipeWire is concerned it genuinely is the same
+              process.
 """
 
 import json
@@ -116,19 +126,11 @@ VIRTUAL_SPEAKER = "conduit_virtual_speaker"
 VIRTUAL_MIC = "conduit_virtual_mic"
 _OUR_VIRTUAL_NODE_NAMES = {VIRTUAL_SPEAKER, VIRTUAL_MIC}
 
-
-def _empty_list_config():
-    return {"items": [], "auto_detect": {"prefix": False, "keyword": False, "keyword_text": "", "same_app": False}}
-
+DEFAULT_AUTO_DETECT = {"prefix": False, "keyword": False, "keyword_text": "", "same_app": False}
 
 DEFAULT_STATE = {
-    "mic": {"inputs": _empty_list_config(), "outputs": _empty_list_config()},
-    "speaker": {
-        "inputs": _empty_list_config(),
-        "outputs": _empty_list_config(),
-        "bypass": _empty_list_config(),
-        "bypass_target": None,
-    },
+    "mic": {"inputs": [], "outputs": []},
+    "speaker": {"inputs": [], "outputs": [], "bypass": [], "bypass_target": None},
 }
 
 
@@ -142,18 +144,37 @@ def ensure_config_exists():
         STATE_FILE.write_text(json.dumps(DEFAULT_STATE, indent=2))
 
 
-def _merge_list_config(default, loaded):
-    merged = json.loads(json.dumps(default))
+def _migrate_items(loaded):
+    """Normalize a config list to [{"label": ..., "auto_detect": {...}}, ...],
+    transparently handling every prior on-disk shape rather than discarding
+    an already-working config:
+      - flat list of strings (original format, pre auto-detect)
+      - {"items": [...strings...], "auto_detect": {...}} (short-lived
+        list-wide auto-detect format)
+      - already-current list of {"label", "auto_detect"} dicts
+    """
+    def fresh_entry(label, auto_detect_seed=None):
+        ad = dict(DEFAULT_AUTO_DETECT)
+        if isinstance(auto_detect_seed, dict):
+            ad.update(auto_detect_seed)
+        return {"label": label, "auto_detect": ad}
+
     if isinstance(loaded, list):
-        # Old flat-list format (pre auto-detect) -- migrate transparently
-        # rather than discarding an already-working config.
-        merged["items"] = loaded
-    elif isinstance(loaded, dict):
-        if isinstance(loaded.get("items"), list):
-            merged["items"] = loaded["items"]
-        if isinstance(loaded.get("auto_detect"), dict):
-            merged["auto_detect"].update(loaded["auto_detect"])
-    return merged
+        result = []
+        for entry in loaded:
+            if isinstance(entry, str):
+                result.append(fresh_entry(entry))
+            elif isinstance(entry, dict) and isinstance(entry.get("label"), str):
+                result.append(fresh_entry(entry["label"], entry.get("auto_detect")))
+        return result
+
+    if isinstance(loaded, dict) and isinstance(loaded.get("items"), list):
+        # The brief list-wide auto_detect format -- apply it to each item
+        # as a starting point rather than dropping the setting entirely.
+        shared_ad = loaded.get("auto_detect") if isinstance(loaded.get("auto_detect"), dict) else None
+        return [fresh_entry(e, shared_ad) for e in loaded["items"] if isinstance(e, str)]
+
+    return []
 
 
 def load_state():
@@ -163,12 +184,12 @@ def load_state():
         data = {}
     state = json.loads(json.dumps(DEFAULT_STATE))
     mic = data.get("mic", {}) if isinstance(data.get("mic"), dict) else {}
-    state["mic"]["inputs"] = _merge_list_config(state["mic"]["inputs"], mic.get("inputs"))
-    state["mic"]["outputs"] = _merge_list_config(state["mic"]["outputs"], mic.get("outputs"))
+    state["mic"]["inputs"] = _migrate_items(mic.get("inputs"))
+    state["mic"]["outputs"] = _migrate_items(mic.get("outputs"))
     speaker = data.get("speaker", {}) if isinstance(data.get("speaker"), dict) else {}
-    state["speaker"]["inputs"] = _merge_list_config(state["speaker"]["inputs"], speaker.get("inputs"))
-    state["speaker"]["outputs"] = _merge_list_config(state["speaker"]["outputs"], speaker.get("outputs"))
-    state["speaker"]["bypass"] = _merge_list_config(state["speaker"]["bypass"], speaker.get("bypass"))
+    state["speaker"]["inputs"] = _migrate_items(speaker.get("inputs"))
+    state["speaker"]["outputs"] = _migrate_items(speaker.get("outputs"))
+    state["speaker"]["bypass"] = _migrate_items(speaker.get("bypass"))
     if speaker.get("bypass_target"):
         state["speaker"]["bypass_target"] = speaker["bypass_target"]
     return state
@@ -336,21 +357,25 @@ def _strip_counter_suffix(label):
     return _TRAILING_COUNTER_RE.sub('', label).strip()
 
 
-def expand_auto_detect(items, auto_detect, nodes, predicate):
-    """Return the effective set of labels to route for one list: the
-    explicitly-saved items, plus any currently-live node that matches an
-    enabled auto-detect strategy relative to one of those items. Purely a
-    runtime computation -- nothing here gets written back to state.json."""
-    result = set(items)
+def expand_item_auto_detect(label, auto_detect, nodes, predicate):
+    """Return the effective set of labels covered by ONE saved entry: its
+    own label, plus any currently-live node matching one of that entry's
+    enabled auto-detect strategies relative to it specifically. Scoped to
+    a single entry rather than a whole list, since a list often mixes
+    real hardware (which never needs this) with an app-created virtual
+    device (which might) -- a list-wide setting would wrongly apply
+    prefix/keyword/same-app matching to entries that have nothing to do
+    with each other."""
+    result = {label}
     if not auto_detect.get("prefix") and not auto_detect.get("keyword") and not auto_detect.get("same_app"):
         return result
 
     candidates = [n for n in nodes.values() if predicate(n)]
 
     if auto_detect.get("prefix"):
-        seed_prefixes = {_strip_counter_suffix(label) for label in items}
+        seed_prefix = _strip_counter_suffix(label)
         for node in candidates:
-            if _strip_counter_suffix(node.display_label) in seed_prefixes:
+            if _strip_counter_suffix(node.display_label) == seed_prefix:
                 result.add(node.display_label)
 
     keyword = (auto_detect.get("keyword_text") or "").strip().lower()
@@ -362,13 +387,23 @@ def expand_auto_detect(items, auto_detect, nodes, predicate):
     if auto_detect.get("same_app"):
         seed_client_ids = {
             node.client_id for node in candidates
-            if node.display_label in items and node.client_id is not None
+            if node.display_label == label and node.client_id is not None
         }
         if seed_client_ids:
             for node in candidates:
                 if node.client_id in seed_client_ids:
                     result.add(node.display_label)
 
+    return result
+
+
+def expand_items(entries, nodes, predicate):
+    """Union expand_item_auto_detect() over every {"label", "auto_detect"}
+    entry in a list -- the full effective label set to route for that
+    whole section."""
+    result = set()
+    for entry in entries:
+        result |= expand_item_auto_detect(entry["label"], entry.get("auto_detect", DEFAULT_AUTO_DETECT), nodes, predicate)
     return result
 
 
@@ -426,27 +461,22 @@ def compute_desired_links(state, nodes):
     # recording device (its output ports feed whatever selects it as
     # a source) -- see module.nix for why one node covers both roles.
     if virtual_mic:
-        mic_in_cfg = state["mic"]["inputs"]
-        for label in expand_auto_detect(mic_in_cfg["items"], mic_in_cfg["auto_detect"], nodes, is_producer):
+        for label in expand_items(state["mic"]["inputs"], nodes, is_producer):
             real_mic = find_node_verbose(nodes, label, is_producer, "mic input")
             route(real_mic, virtual_mic)
-        mic_out_cfg = state["mic"]["outputs"]
-        for label in expand_auto_detect(mic_out_cfg["items"], mic_out_cfg["auto_detect"], nodes, is_consumer):
+        for label in expand_items(state["mic"]["outputs"], nodes, is_consumer):
             app = find_node_verbose(nodes, label, is_consumer, "mic output")
             route(virtual_mic, app)
 
     # --- Speaker side ---
-    bypass_cfg = state["speaker"]["bypass"]
-    bypass_set = expand_auto_detect(bypass_cfg["items"], bypass_cfg["auto_detect"], nodes, is_producer)
+    bypass_set = expand_items(state["speaker"]["bypass"], nodes, is_producer)
     if virtual_speaker:
-        speaker_in_cfg = state["speaker"]["inputs"]
-        for label in expand_auto_detect(speaker_in_cfg["items"], speaker_in_cfg["auto_detect"], nodes, is_producer):
+        for label in expand_items(state["speaker"]["inputs"], nodes, is_producer):
             if label in bypass_set:
                 continue  # bypass always wins over inputs
             app = find_node_verbose(nodes, label, is_producer, "speaker input")
             route(app, virtual_speaker)
-        speaker_out_cfg = state["speaker"]["outputs"]
-        for label in expand_auto_detect(speaker_out_cfg["items"], speaker_out_cfg["auto_detect"], nodes, is_consumer):
+        for label in expand_items(state["speaker"]["outputs"], nodes, is_consumer):
             destination = find_node_verbose(nodes, label, is_consumer, "speaker output")
             if destination is None or virtual_speaker is None:
                 continue
@@ -519,30 +549,29 @@ def enforce_defaults(nodes):
 def main():
     ensure_config_exists()
     print("conduit-daemon: starting, watching", STATE_FILE, flush=True)
-    printed_debug_sample = False
+    printed_inventory = False
     while True:
         try:
             state = load_state()
-            print(f"conduit-daemon: loaded state: {json.dumps(state)}", flush=True)
             dump = pw_dump()
-            print(f"conduit-daemon: pw-dump returned {len(dump)} objects", flush=True)
             if dump:
-                if not printed_debug_sample:
-                    # One-time raw sample so we can confirm the actual JSON
-                    # shape pw-dump produces on this PipeWire version,
-                    # instead of assuming it matches the docs.
-                    sample_node = next((o for o in dump if o.get("type") == "PipeWire:Interface:Node"), None)
-                    sample_ports = [o for o in dump if o.get("type") == "PipeWire:Interface:Port"][:2]
-                    print("conduit-daemon: SAMPLE NODE: " + json.dumps(sample_node), flush=True)
-                    for p in sample_ports:
-                        print("conduit-daemon: SAMPLE PORT: " + json.dumps(p), flush=True)
-                    printed_debug_sample = True
-
                 nodes = build_graph(dump)
-                total_out = sum(len(n.output_ports) for n in nodes.values())
-                total_in = sum(len(n.input_ports) for n in nodes.values())
-                print(f"conduit-daemon: built graph: {len(nodes)} nodes, "
-                      f"{total_out} output ports, {total_in} input ports", flush=True)
+
+                if not printed_inventory:
+                    # One-time-per-restart full inventory: name, class, and
+                    # port counts for every node currently in the graph.
+                    # `journalctl --user -u conduit-daemon | grep -i vencord`
+                    # (or whatever you're chasing) shows exactly why a
+                    # device isn't eligible -- most commonly 0 ports on
+                    # both sides, which no matching logic can work around.
+                    print(f"conduit-daemon: node inventory ({len(nodes)} nodes):", flush=True)
+                    for node in sorted(nodes.values(), key=lambda n: n.display_label.lower()):
+                        print(f"conduit-daemon:   {node.display_label!r} "
+                              f"(name={node.name!r} class={node.media_class!r} "
+                              f"in_ports={len(node.input_ports)} out_ports={len(node.output_ports)} "
+                              f"client_id={node.client_id})", flush=True)
+                    printed_inventory = True
+
                 enforce_defaults(nodes)
                 reconcile(state, nodes, dump)
         except Exception:

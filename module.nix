@@ -38,11 +38,20 @@ let
   # launch fails with "could not find the Qt platform plugin xcb/wayland".
   qtPluginPath = "${pkgs.qt6.qtbase}/lib/qt-6/plugins";
 
+  # Icon lookup by name (as used in the .desktop entry below) walks
+  # share/icons/hicolor/<size>/apps/<name>.<ext> under each
+  # XDG_DATA_DIRS entry, so it has to be installed at exactly this
+  # path layout to be found by launchers/taskbars at all. Resized at
+  # build time with ImageMagick from the single source logo rather
+  # than committing a pile of pre-scaled duplicates to the repo --
+  # same approach as Puppetry.
+  conduitIconSizes = [ 16 24 32 48 64 128 256 ];
+
   conduitGui = pkgs.stdenv.mkDerivation {
     pname = "conduit";
     version = "1.0";
     dontUnpack = true;
-    nativeBuildInputs = [ pkgs.makeWrapper ];
+    nativeBuildInputs = [ pkgs.makeWrapper pkgs.imagemagick ];
     installPhase = ''
       mkdir -p $out/bin
       makeWrapper ${guiPython}/bin/python3 $out/bin/conduit \
@@ -51,16 +60,19 @@ let
         --set QT_PLUGIN_PATH "${qtPluginPath}" \
         --set QT_QPA_PLATFORM_PLUGIN_PATH "${qtPluginPath}/platforms" \
         --prefix PATH : "${pkgs.pipewire}/bin:${pkgs.wireplumber}/bin"
+
+      ${lib.concatMapStringsSep "\n" (sz: ''
+        mkdir -p $out/share/icons/hicolor/${toString sz}x${toString sz}/apps
+        convert ${./assets/conduit_logo.png} -resize ${toString sz}x${toString sz} \
+          $out/share/icons/hicolor/${toString sz}x${toString sz}/apps/conduit.png
+      '') conduitIconSizes}
     '';
   };
 
-  # "audio-card" is a standard freedesktop icon-naming-spec name, so
-  # this resolves correctly against whatever icon theme is active
-  # (Breeze on your Plasma setup) with no custom art needed.
   conduitDesktopItem = pkgs.makeDesktopItem {
     name = "conduit";
     exec = "conduit";
-    icon = "audio-card";
+    icon = "conduit";
     desktopName = "Conduit";
     comment = "Configure the virtual mic/speaker router";
     categories = [ "AudioVideo" "Audio" ];
