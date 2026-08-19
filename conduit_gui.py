@@ -30,10 +30,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import conduit_daemon as cd
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QPoint
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QListWidget, QListWidgetItem, QPushButton, QFrame,
+    QCheckBox, QLineEdit,
 )
 
 PLACEHOLDER = "Add a device or app…"
@@ -46,12 +48,10 @@ RESTART_DEBOUNCE_MS = 600
 # (apps come and go, so this can't be cached for long).
 # ---------------------------------------------------------------------------
 
-def eligible_labels(nodes, classes):
+def eligible_labels(nodes, predicate):
     labels = []
     for node in nodes.values():
-        if node.is_ours:
-            continue
-        if node.media_class in classes:
+        if predicate(node):
             label = node.display_label
             if label and label not in labels:
                 labels.append(label)
@@ -66,6 +66,70 @@ def current_nodes():
 
 
 # ---------------------------------------------------------------------------
+# Auto-Detect: a small popup (opened via the up-arrow button on each
+# section) letting you combine any of three strategies for sweeping in
+# devices you didn't explicitly add. See conduit_daemon.expand_auto_detect
+# for exactly how each one matches.
+# ---------------------------------------------------------------------------
+
+DEFAULT_AUTO_DETECT = {"prefix": False, "keyword": False, "keyword_text": "", "same_app": False}
+
+
+class AutoDetectPopup(QWidget):
+    def __init__(self, config, on_apply, anchor_widget):
+        super().__init__(anchor_widget, Qt.Popup)
+        self._on_apply = on_apply
+        self.setContentsMargins(0, 0, 0, 0)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(QLabel("<b>Auto-Detect</b>"))
+
+        self.prefix_cb = QCheckBox("Prefix match")
+        self.prefix_cb.setToolTip('"Chromium input-2" counts as the same device as a saved "Chromium input"')
+        self.prefix_cb.setChecked(config.get("prefix", False))
+        layout.addWidget(self.prefix_cb)
+
+        self.keyword_cb = QCheckBox("Keyword match")
+        layout.addWidget(self.keyword_cb)
+
+        self.keyword_edit = QLineEdit(config.get("keyword_text", ""))
+        self.keyword_edit.setPlaceholderText("e.g. vencord")
+        layout.addWidget(self.keyword_edit)
+        self.keyword_cb.setChecked(config.get("keyword", False))
+        self.keyword_edit.setEnabled(self.keyword_cb.isChecked())
+
+        self.same_app_cb = QCheckBox("Same source app")
+        self.same_app_cb.setToolTip("Groups every stream created by the same running app/process, "
+                                     "however differently each one is named")
+        self.same_app_cb.setChecked(config.get("same_app", False))
+        layout.addWidget(self.same_app_cb)
+
+        # Wire signals up only after every widget has its initial state --
+        # otherwise setChecked() above would itself fire _apply() and
+        # trigger a pointless save/daemon-restart just from opening the
+        # popup, before the person has touched anything.
+        self.prefix_cb.toggled.connect(self._apply)
+        self.keyword_cb.toggled.connect(self._on_keyword_toggled)
+        self.keyword_edit.editingFinished.connect(self._apply)
+        self.same_app_cb.toggled.connect(self._apply)
+
+        self.adjustSize()
+
+    def _on_keyword_toggled(self, checked):
+        self.keyword_edit.setEnabled(checked)
+        self._apply()
+
+    def _apply(self):
+        self._on_apply({
+            "prefix": self.prefix_cb.isChecked(),
+            "keyword": self.keyword_cb.isChecked(),
+            "keyword_text": self.keyword_edit.text(),
+            "same_app": self.same_app_cb.isChecked(),
+        })
+
+
+# ---------------------------------------------------------------------------
 # A labeled "dropdown adds to a removable list" widget.
 # ---------------------------------------------------------------------------
 
@@ -74,11 +138,19 @@ class AddListSection(QWidget):
         super().__init__(parent)
         self._on_change = on_change
         self._eligible = []
+        self._auto_detect = dict(DEFAULT_AUTO_DETECT)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        layout.addWidget(QLabel(f"<b>{title}</b>"))
+        header = QHBoxLayout()
+        header.addWidget(QLabel(f"<b>{title}</b>"))
+        header.addStretch()
+        self.auto_detect_btn = QPushButton("\u25B2 Auto-Detect")
+        self.auto_detect_btn.setFlat(True)
+        self.auto_detect_btn.clicked.connect(self._open_auto_detect_popup)
+        header.addWidget(self.auto_detect_btn)
+        layout.addLayout(header)
 
         self.combo = QComboBox()
         self.combo.addItem(PLACEHOLDER)
@@ -88,6 +160,27 @@ class AddListSection(QWidget):
         self.list_widget = QListWidget()
         self.list_widget.setMaximumHeight(110)
         layout.addWidget(self.list_widget)
+
+    def _open_auto_detect_popup(self):
+        popup = AutoDetectPopup(self._auto_detect, self._apply_auto_detect, self.auto_detect_btn)
+        popup.move(self.auto_detect_btn.mapToGlobal(QPoint(0, -popup.sizeHint().height())))
+        popup.show()
+
+    def _apply_auto_detect(self, config):
+        self._auto_detect = config
+        self._update_auto_detect_label()
+        self._on_change()
+
+    def get_auto_detect(self):
+        return dict(self._auto_detect)
+
+    def set_auto_detect(self, config):
+        self._auto_detect = {**DEFAULT_AUTO_DETECT, **(config or {})}
+        self._update_auto_detect_label()
+
+    def _update_auto_detect_label(self):
+        active = self._auto_detect["prefix"] or self._auto_detect["keyword"] or self._auto_detect["same_app"]
+        self.auto_detect_btn.setText("\u25B2 Auto-Detect \u2713" if active else "\u25B2 Auto-Detect")
 
     def set_eligible(self, labels):
         self._eligible = labels
@@ -195,6 +288,7 @@ class ConduitWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Conduit")
+        self.setWindowIcon(QIcon.fromTheme("conduit"))
         self.resize(760, 480)
 
         self._restart_timer = QTimer(self)
@@ -252,35 +346,40 @@ class ConduitWindow(QMainWindow):
 
     def refresh_devices(self):
         nodes = current_nodes()
-        self.mic_inputs.set_eligible(eligible_labels(nodes, {cd.HW_SOURCE}))
-        self.mic_outputs.set_eligible(eligible_labels(nodes, {cd.APP_INPUT, cd.HW_SINK}))
-        self.speaker_inputs.set_eligible(eligible_labels(nodes, {cd.APP_OUTPUT, cd.HW_SOURCE}))
-        self.speaker_outputs.set_eligible(eligible_labels(nodes, {cd.HW_SINK}))
-        self.speaker_bypass.set_eligible(eligible_labels(nodes, {cd.APP_OUTPUT, cd.HW_SOURCE}))
-        self.speakers_target.set_eligible(eligible_labels(nodes, {cd.HW_SINK}))
+        self.mic_inputs.set_eligible(eligible_labels(nodes, cd.is_producer))
+        self.mic_outputs.set_eligible(eligible_labels(nodes, cd.is_consumer))
+        self.speaker_inputs.set_eligible(eligible_labels(nodes, cd.is_producer))
+        self.speaker_outputs.set_eligible(eligible_labels(nodes, cd.is_consumer))
+        self.speaker_bypass.set_eligible(eligible_labels(nodes, cd.is_producer))
+        self.speakers_target.set_eligible(eligible_labels(nodes, cd.is_hardware_sink))
 
     # -- persistence ------------------------------------------------------
 
     def load_state(self):
         cd.ensure_config_exists()
         state = cd.load_state()
-        self.mic_inputs.set_items(state["mic"]["inputs"])
-        self.mic_outputs.set_items(state["mic"]["outputs"])
-        self.speaker_inputs.set_items(state["speaker"]["inputs"])
-        self.speaker_outputs.set_items(state["speaker"]["outputs"])
-        self.speaker_bypass.set_items(state["speaker"]["bypass"])
+        self.mic_inputs.set_items(state["mic"]["inputs"]["items"])
+        self.mic_inputs.set_auto_detect(state["mic"]["inputs"]["auto_detect"])
+        self.mic_outputs.set_items(state["mic"]["outputs"]["items"])
+        self.mic_outputs.set_auto_detect(state["mic"]["outputs"]["auto_detect"])
+        self.speaker_inputs.set_items(state["speaker"]["inputs"]["items"])
+        self.speaker_inputs.set_auto_detect(state["speaker"]["inputs"]["auto_detect"])
+        self.speaker_outputs.set_items(state["speaker"]["outputs"]["items"])
+        self.speaker_outputs.set_auto_detect(state["speaker"]["outputs"]["auto_detect"])
+        self.speaker_bypass.set_items(state["speaker"]["bypass"]["items"])
+        self.speaker_bypass.set_auto_detect(state["speaker"]["bypass"]["auto_detect"])
         self.speakers_target.set_value(state["speaker"].get("bypass_target"))
 
     def _current_state(self):
         return {
             "mic": {
-                "inputs": self.mic_inputs.items(),
-                "outputs": self.mic_outputs.items(),
+                "inputs": {"items": self.mic_inputs.items(), "auto_detect": self.mic_inputs.get_auto_detect()},
+                "outputs": {"items": self.mic_outputs.items(), "auto_detect": self.mic_outputs.get_auto_detect()},
             },
             "speaker": {
-                "inputs": self.speaker_inputs.items(),
-                "outputs": self.speaker_outputs.items(),
-                "bypass": self.speaker_bypass.items(),
+                "inputs": {"items": self.speaker_inputs.items(), "auto_detect": self.speaker_inputs.get_auto_detect()},
+                "outputs": {"items": self.speaker_outputs.items(), "auto_detect": self.speaker_outputs.get_auto_detect()},
+                "bypass": {"items": self.speaker_bypass.items(), "auto_detect": self.speaker_bypass.get_auto_detect()},
                 "bypass_target": self.speakers_target.value(),
             },
         }

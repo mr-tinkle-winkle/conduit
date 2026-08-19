@@ -52,14 +52,14 @@ CONFIG LAYOUT
 
   {
     "mic": {
-      "inputs":  ["Blue Yeti Analog Stereo"],   // real mic node.description values
-      "outputs": []                              // extra apps to also feed the virtual mic into
+      "inputs":  {"items": ["Blue Yeti Analog Stereo"], "auto_detect": {...}},
+      "outputs": {"items": [], "auto_detect": {...}}
     },
     "speaker": {
-      "inputs":  ["Spotify"],                    // apps routed into the virtual speaker
-      "outputs": ["Family 17h (HDMI)"],           // real output device(s) the mix is sent to
-      "bypass":  ["Spotify"],                     // apps forced around the virtual speaker
-      "bypass_target": "Family 17h (HDMI)"        // single real device bypassed apps go to
+      "inputs":  {"items": ["Spotify"], "auto_detect": {...}},
+      "outputs": {"items": ["Family 17h (HDMI)"], "auto_detect": {...}},
+      "bypass":  {"items": ["Spotify"], "auto_detect": {...}},
+      "bypass_target": "Family 17h (HDMI)"
     }
   }
 
@@ -68,9 +68,39 @@ same physical hardware); apps are matched by application.name. An app
 listed in both "inputs" and "bypass" is treated as bypass-only --
 bypass always wins, since the whole point is to skip the virtual mix
 for that one app.
+
+AUTO-DETECT
+-----------
+Each list's "auto_detect" is:
+
+  {"prefix": bool, "keyword": bool, "keyword_text": str, "same_app": bool}
+
+"items" are what you explicitly picked in the GUI -- the templates.
+When any auto_detect strategy is on, every reconcile cycle also routes
+any *currently live* device that matches one of the enabled strategies
+relative to an item, without writing it back into "items". This is
+deliberately ephemeral: state.json (and the GUI's visible list) always
+reflects only what you explicitly added, and matched devices come and
+go from routing as PipeWire's graph changes, which is exactly what you
+want for something like Discord spinning up a differently-numbered
+capture stream per screen share.
+
+  - prefix:   strip a trailing counter/suffix ("-2", " (3)", "#4", ...)
+              from both the item and the candidate's label, and match
+              if what's left is identical. Catches "Chromium input-2"
+              off of a saved "Chromium input".
+  - keyword:  substring match (case-insensitive) against keyword_text,
+              independent of any saved item.
+  - same_app: match by the underlying PipeWire client (client.id) --
+              catches every stream a single running app/process
+              creates, however differently each one is named. Only
+              works while at least one node whose label exactly
+              matches a saved item is currently live, since that's
+              what supplies the reference client.id to expand from.
 """
 
 import json
+import re
 import subprocess
 import sys
 import time
@@ -86,9 +116,19 @@ VIRTUAL_SPEAKER = "conduit_virtual_speaker"
 VIRTUAL_MIC = "conduit_virtual_mic"
 _OUR_VIRTUAL_NODE_NAMES = {VIRTUAL_SPEAKER, VIRTUAL_MIC}
 
+
+def _empty_list_config():
+    return {"items": [], "auto_detect": {"prefix": False, "keyword": False, "keyword_text": "", "same_app": False}}
+
+
 DEFAULT_STATE = {
-    "mic": {"inputs": [], "outputs": []},
-    "speaker": {"inputs": [], "outputs": [], "bypass": [], "bypass_target": None},
+    "mic": {"inputs": _empty_list_config(), "outputs": _empty_list_config()},
+    "speaker": {
+        "inputs": _empty_list_config(),
+        "outputs": _empty_list_config(),
+        "bypass": _empty_list_config(),
+        "bypass_target": None,
+    },
 }
 
 
@@ -102,15 +142,35 @@ def ensure_config_exists():
         STATE_FILE.write_text(json.dumps(DEFAULT_STATE, indent=2))
 
 
+def _merge_list_config(default, loaded):
+    merged = json.loads(json.dumps(default))
+    if isinstance(loaded, list):
+        # Old flat-list format (pre auto-detect) -- migrate transparently
+        # rather than discarding an already-working config.
+        merged["items"] = loaded
+    elif isinstance(loaded, dict):
+        if isinstance(loaded.get("items"), list):
+            merged["items"] = loaded["items"]
+        if isinstance(loaded.get("auto_detect"), dict):
+            merged["auto_detect"].update(loaded["auto_detect"])
+    return merged
+
+
 def load_state():
     try:
         data = json.loads(STATE_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
-        return json.loads(json.dumps(DEFAULT_STATE))  # deep copy
-    # Merge onto defaults so a partially-hand-edited file doesn't crash us.
+        data = {}
     state = json.loads(json.dumps(DEFAULT_STATE))
-    for section in ("mic", "speaker"):
-        state[section].update(data.get(section, {}))
+    mic = data.get("mic", {}) if isinstance(data.get("mic"), dict) else {}
+    state["mic"]["inputs"] = _merge_list_config(state["mic"]["inputs"], mic.get("inputs"))
+    state["mic"]["outputs"] = _merge_list_config(state["mic"]["outputs"], mic.get("outputs"))
+    speaker = data.get("speaker", {}) if isinstance(data.get("speaker"), dict) else {}
+    state["speaker"]["inputs"] = _merge_list_config(state["speaker"]["inputs"], speaker.get("inputs"))
+    state["speaker"]["outputs"] = _merge_list_config(state["speaker"]["outputs"], speaker.get("outputs"))
+    state["speaker"]["bypass"] = _merge_list_config(state["speaker"]["bypass"], speaker.get("bypass"))
+    if speaker.get("bypass_target"):
+        state["speaker"]["bypass_target"] = speaker["bypass_target"]
     return state
 
 
@@ -138,7 +198,7 @@ def pw_dump():
 
 class Node:
     __slots__ = ("id", "name", "description", "app_name", "media_class",
-                 "output_ports", "input_ports")
+                 "client_id", "output_ports", "input_ports")
 
     def __init__(self, id_, props):
         self.id = id_
@@ -146,6 +206,7 @@ class Node:
         self.description = props.get("node.description", self.name)
         self.app_name = props.get("application.name")
         self.media_class = props.get("media.class", "")
+        self.client_id = props.get("client.id")
         self.output_ports = []  # list of (port_id, channel)
         self.input_ports = []
 
@@ -201,35 +262,58 @@ def current_links(dump):
 # ---------------------------------------------------------------------------
 # MATCHING
 # ---------------------------------------------------------------------------
+#
+# Eligibility is based on which ports a node actually has, not on its
+# media.class string. This matches the original spec literally ("for
+# inputs, any outputs are eligible; for outputs, any inputs are
+# eligible") and, importantly, is robust to apps that create their own
+# virtual devices with nonstandard media.class values -- e.g. Vesktop
+# creates a node for its screen-share audio capture that behaves like
+# a sink (it has input ports to receive the mix) but isn't necessarily
+# tagged "Audio/Sink". Filtering by "does it have the right kind of
+# port" catches those automatically; filtering by class string doesn't.
+#
+# HW_SINK is kept separately for the one place a class check is still
+# useful: the "Speakers" bypass-target picker, which should only ever
+# offer real physical output hardware, not a random app.
 
 HW_SINK = "Audio/Sink"
-HW_SOURCE = "Audio/Source"
-APP_OUTPUT = "Stream/Output/Audio"
-APP_INPUT = "Stream/Input/Audio"
 
 
-def find_node(nodes, label, allowed_classes):
+def is_producer(node):
+    """Eligible for anything wanting an audio *source* to pull from --
+    real mics, apps that are playing sound, virtual devices with
+    output ports, etc."""
+    return not node.is_ours and len(node.output_ports) > 0
+
+
+def is_consumer(node):
+    """Eligible for anything wanting an audio *destination* to feed --
+    real speakers, apps that are listening/recording, virtual devices
+    with input ports, etc."""
+    return not node.is_ours and len(node.input_ports) > 0
+
+
+def is_hardware_sink(node):
+    return not node.is_ours and node.media_class == HW_SINK
+
+
+def find_node(nodes, label, predicate):
     for node in nodes.values():
-        if node.is_ours:
-            continue
-        if node.media_class in allowed_classes and node.display_label == label:
+        if predicate(node) and node.display_label == label:
             return node
     return None
 
 
-def find_node_verbose(nodes, label, allowed_classes, context):
+def find_node_verbose(nodes, label, predicate, context):
     """Same as find_node, but logs a hint when a label from state.json
     doesn't match anything currently in the graph -- the single most
     common cause of "it's configured but nothing happens"."""
-    node = find_node(nodes, label, allowed_classes)
+    node = find_node(nodes, label, predicate)
     if node is None:
-        candidates = sorted(
-            n.display_label for n in nodes.values()
-            if n.media_class in allowed_classes and not n.is_ours
-        )
+        candidates = sorted(n.display_label for n in nodes.values() if predicate(n))
         print(f"conduit-daemon: [{context}] no live node matches "
-              f"{label!r} (looked in {sorted(allowed_classes)}); "
-              f"currently eligible: {candidates}", flush=True)
+              f"{label!r}; currently eligible: {candidates}", flush=True)
     return node
 
 
@@ -238,6 +322,54 @@ def find_virtual(nodes, name):
         if node.name == name:
             return node
     return None
+
+
+# ---------------------------------------------------------------------------
+# AUTO-DETECT
+# ---------------------------------------------------------------------------
+
+_TRAILING_COUNTER_RE = re.compile(r'[\s\-_#(]*\d+\)?\s*$')
+
+
+def _strip_counter_suffix(label):
+    """'Chromium input-2' -> 'Chromium input'; 'Chromium input' unchanged."""
+    return _TRAILING_COUNTER_RE.sub('', label).strip()
+
+
+def expand_auto_detect(items, auto_detect, nodes, predicate):
+    """Return the effective set of labels to route for one list: the
+    explicitly-saved items, plus any currently-live node that matches an
+    enabled auto-detect strategy relative to one of those items. Purely a
+    runtime computation -- nothing here gets written back to state.json."""
+    result = set(items)
+    if not auto_detect.get("prefix") and not auto_detect.get("keyword") and not auto_detect.get("same_app"):
+        return result
+
+    candidates = [n for n in nodes.values() if predicate(n)]
+
+    if auto_detect.get("prefix"):
+        seed_prefixes = {_strip_counter_suffix(label) for label in items}
+        for node in candidates:
+            if _strip_counter_suffix(node.display_label) in seed_prefixes:
+                result.add(node.display_label)
+
+    keyword = (auto_detect.get("keyword_text") or "").strip().lower()
+    if auto_detect.get("keyword") and keyword:
+        for node in candidates:
+            if keyword in node.display_label.lower():
+                result.add(node.display_label)
+
+    if auto_detect.get("same_app"):
+        seed_client_ids = {
+            node.client_id for node in candidates
+            if node.display_label in items and node.client_id is not None
+        }
+        if seed_client_ids:
+            for node in candidates:
+                if node.client_id in seed_client_ids:
+                    result.add(node.display_label)
+
+    return result
 
 
 def pair_ports(src_ports, dst_ports):
@@ -294,41 +426,48 @@ def compute_desired_links(state, nodes):
     # recording device (its output ports feed whatever selects it as
     # a source) -- see module.nix for why one node covers both roles.
     if virtual_mic:
-        for label in state["mic"]["inputs"]:
-            real_mic = find_node_verbose(nodes, label, {HW_SOURCE}, "mic input")
+        mic_in_cfg = state["mic"]["inputs"]
+        for label in expand_auto_detect(mic_in_cfg["items"], mic_in_cfg["auto_detect"], nodes, is_producer):
+            real_mic = find_node_verbose(nodes, label, is_producer, "mic input")
             route(real_mic, virtual_mic)
-        for label in state["mic"]["outputs"]:
-            app = find_node_verbose(nodes, label, {APP_INPUT, HW_SINK}, "mic output")
+        mic_out_cfg = state["mic"]["outputs"]
+        for label in expand_auto_detect(mic_out_cfg["items"], mic_out_cfg["auto_detect"], nodes, is_consumer):
+            app = find_node_verbose(nodes, label, is_consumer, "mic output")
             route(virtual_mic, app)
 
     # --- Speaker side ---
-    bypass_set = set(state["speaker"]["bypass"])
+    bypass_cfg = state["speaker"]["bypass"]
+    bypass_set = expand_auto_detect(bypass_cfg["items"], bypass_cfg["auto_detect"], nodes, is_producer)
     if virtual_speaker:
-        for label in state["speaker"]["inputs"]:
+        speaker_in_cfg = state["speaker"]["inputs"]
+        for label in expand_auto_detect(speaker_in_cfg["items"], speaker_in_cfg["auto_detect"], nodes, is_producer):
             if label in bypass_set:
                 continue  # bypass always wins over inputs
-            app = find_node_verbose(nodes, label, {APP_OUTPUT, HW_SOURCE}, "speaker input")
+            app = find_node_verbose(nodes, label, is_producer, "speaker input")
             route(app, virtual_speaker)
-        for label in state["speaker"]["outputs"]:
-            real_speaker = find_node_verbose(nodes, label, {HW_SINK}, "speaker output")
-            if real_speaker is None or virtual_speaker is None:
+        speaker_out_cfg = state["speaker"]["outputs"]
+        for label in expand_auto_detect(speaker_out_cfg["items"], speaker_out_cfg["auto_detect"], nodes, is_consumer):
+            destination = find_node_verbose(nodes, label, is_consumer, "speaker output")
+            if destination is None or virtual_speaker is None:
                 continue
-            for pair in pair_ports(virtual_speaker.output_ports, real_speaker.input_ports):
+            for pair in pair_ports(virtual_speaker.output_ports, destination.input_ports):
                 # virtual_speaker itself has no output ports (it's a sink) --
                 # what we actually want is its *monitor* ports, which pw-dump
                 # reports as this same node's output ports since a sink's
-                # monitor ports live on the sink node itself.
+                # monitor ports live on the sink node itself. The
+                # destination can be real hardware or an app that wants to
+                # consume the mix (e.g. a screen-share audio capture node).
                 desired.add(pair)
-            managed_node_pairs.add((virtual_speaker.id, real_speaker.id))
+            managed_node_pairs.add((virtual_speaker.id, destination.id))
 
     # --- Bypass: force-disconnect from virtual speaker, connect direct ---
     bypass_target_label = state["speaker"].get("bypass_target")
     bypass_target = (
-        find_node_verbose(nodes, bypass_target_label, {HW_SINK}, "bypass target")
+        find_node_verbose(nodes, bypass_target_label, is_hardware_sink, "bypass target")
         if bypass_target_label else None
     )
     for label in bypass_set:
-        app = find_node_verbose(nodes, label, {APP_OUTPUT}, "bypass app")
+        app = find_node_verbose(nodes, label, is_producer, "bypass app")
         if app is None:
             continue
         # Always mark (app -> virtual_speaker) as managed so any existing
