@@ -98,10 +98,10 @@ Two panels: **Speaker** on the left, **Microphone** on the right.
   The Speakers picker specifically stays hardware-only, since that's
   "your speakers" in the bypass sense.
 - **Every device row has a small `^` button** that opens a popup with
-  three combinable Auto-Detect strategies for sweeping in devices you
-  didn't explicitly add. It's per-device, not per-list, since a list
-  often mixes real hardware (which never needs this) with an
-  app-created virtual device (which might):
+  four combinable Auto-Detect strategies for sweeping in (or keeping
+  out) devices you didn't explicitly add. It's per-device, not
+  per-list, since a list often mixes real hardware (which never needs
+  this) with an app-created virtual device (which might):
   - *Prefix match* -- treats "Chromium input-2" as the same device as
     a saved "Chromium input" (strips a trailing counter/suffix before
     comparing).
@@ -111,12 +111,37 @@ Two panels: **Speaker** on the left, **Microphone** on the right.
     running app/process, however differently each one is named. Only
     kicks in while the device this row was saved as is currently live,
     since that's what supplies the reference to expand from.
+  - *Anti-Auto-Detect* -- the inverse: comma-separated keywords that
+    keep a matching device OUT of this row's sweep, even if it would
+    otherwise match prefix/keyword/same-app. Never removes the row's
+    own device, only auto-detected siblings.
 
   This is built for things like Discord/Vesktop, which spin up a
   differently-named capture stream per screen share. Matches are
   purely a routing-time decision -- they never get written back into
   the visible list, so the GUI keeps showing only what you explicitly
   added even as auto-detected devices come and go.
+- **Every device row has an enable checkbox** on the left -- unticking
+  it takes that device out of routing entirely (auto-detect included)
+  without deleting it, so it's a one-click toggle to bring back later.
+- **Every device row has a volume multiplier** (the "1.00x" spinbox) --
+  1.00x leaves the device's volume alone, 2.00x doubles it, 0.50x
+  halves it. It's continuously re-applied every couple of seconds, so
+  it always sits at exactly that level and overrides any manual
+  adjustment you make elsewhere (a system volume mixer, the app's own
+  volume slider, etc.). Only affects the exact device a row is saved
+  as, not any auto-detected siblings it sweeps in.
+- **Removing a device actually undoes its connections.** Conduit
+  remembers what it last connected across daemon restarts (which
+  happen on every save), so taking something out of a list -- or just
+  unticking its enable checkbox -- tears down the link it created
+  instead of leaving it connected until the next reboot.
+- **Close to Tray** hides the window and keeps the daemon-adjacent GUI
+  running in the system tray rather than quitting; click the tray icon
+  (or its "Open Conduit" menu entry) to bring the window back, or
+  "Quit" from the same menu to actually exit. The daemon itself is a
+  separate systemd service either way and keeps running regardless of
+  whether the GUI window, or the tray icon, is open at all.
 - Nothing needs an explicit "Save" — every change writes
   `state.json` immediately and restarts the daemon (debounced by
   ~600ms so rapid changes don't thrash it).
@@ -200,18 +225,23 @@ changes:
 {
   "mic": {
     "inputs": [
-      {"label": "Blue Yeti Analog Stereo", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false}}
+      {
+        "label": "Blue Yeti Analog Stereo",
+        "enabled": true,
+        "volume": 1.0,
+        "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}
+      }
     ],
     "outputs": []
   },
   "speaker": {
     "inputs": [],
     "outputs": [
-      {"label": "Analog Stereo Speakers", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false}},
-      {"label": "vencord-screen-share", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": true}}
+      {"label": "Analog Stereo Speakers", "enabled": true, "volume": 1.0, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}},
+      {"label": "vencord-screen-share", "enabled": true, "volume": 1.0, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": true, "anti": true, "anti_keyword_text": "mic"}}
     ],
     "bypass": [
-      {"label": "Spotify", "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false}}
+      {"label": "Spotify", "enabled": true, "volume": 1.5, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}}
     ],
     "bypass_target": "Analog Stereo Speakers"
   }
@@ -220,9 +250,14 @@ changes:
 
 Devices are matched by their `node.description` (stable across boots
 for the same hardware); apps are matched by `application.name`. Older
-configs from earlier Conduit versions (a flat list of strings, or a
-short-lived list-wide auto-detect format) are migrated automatically
-on next load -- no manual edits needed.
+configs from earlier Conduit versions (missing `enabled`/`volume`, a
+flat list of strings, or a short-lived list-wide auto-detect format)
+are migrated automatically on next load -- no manual edits needed.
+There's also a small internal `~/.config/conduit/.link_cache.json` the
+daemon uses to track what it last connected across restarts, so it can
+undo stale links when you remove or disable something -- not meant to
+be hand-edited, safe to delete if it's ever in a confusing state (the
+daemon just starts fresh with an empty one).
 
 ## Repo layout
 

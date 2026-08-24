@@ -35,7 +35,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QListWidget, QListWidgetItem, QPushButton, QFrame,
-    QCheckBox, QLineEdit,
+    QCheckBox, QLineEdit, QDoubleSpinBox, QSystemTrayIcon, QMenu,
 )
 
 PLACEHOLDER = "Add a device or app…"
@@ -67,13 +67,16 @@ def current_nodes():
 
 # ---------------------------------------------------------------------------
 # Auto-Detect: a small popup (opened via the "^" button on each device row)
-# letting you combine any of three strategies for sweeping in devices you
-# didn't explicitly add. Scoped to that one device, not the whole list --
-# see conduit_daemon.expand_item_auto_detect for exactly how each strategy
-# matches.
+# letting you combine any of four strategies for sweeping in (or keeping
+# out) devices you didn't explicitly add. Scoped to that one device, not
+# the whole list -- see conduit_daemon.expand_item_auto_detect for exactly
+# how each strategy matches.
 # ---------------------------------------------------------------------------
 
-DEFAULT_AUTO_DETECT = {"prefix": False, "keyword": False, "keyword_text": "", "same_app": False}
+DEFAULT_AUTO_DETECT = {
+    "prefix": False, "keyword": False, "keyword_text": "", "same_app": False,
+    "anti": False, "anti_keyword_text": "",
+}
 
 
 class AutoDetectPopup(QWidget):
@@ -106,6 +109,19 @@ class AutoDetectPopup(QWidget):
         self.same_app_cb.setChecked(config.get("same_app", False))
         layout.addWidget(self.same_app_cb)
 
+        layout.addWidget(_hline())
+
+        self.anti_cb = QCheckBox("Anti-Auto-Detect")
+        self.anti_cb.setToolTip("Keeps anything matching these keywords out of this device's auto-detect "
+                                 "sweep above, even if it would otherwise match. Never removes this device itself.")
+        layout.addWidget(self.anti_cb)
+
+        self.anti_edit = QLineEdit(config.get("anti_keyword_text", ""))
+        self.anti_edit.setPlaceholderText("e.g. screenshare, mic (comma-separated)")
+        layout.addWidget(self.anti_edit)
+        self.anti_cb.setChecked(config.get("anti", False))
+        self.anti_edit.setEnabled(self.anti_cb.isChecked())
+
         # Wire signals up only after every widget has its initial state --
         # otherwise setChecked() above would itself fire _apply() and
         # trigger a pointless save/daemon-restart just from opening the
@@ -114,11 +130,17 @@ class AutoDetectPopup(QWidget):
         self.keyword_cb.toggled.connect(self._on_keyword_toggled)
         self.keyword_edit.editingFinished.connect(self._apply)
         self.same_app_cb.toggled.connect(self._apply)
+        self.anti_cb.toggled.connect(self._on_anti_toggled)
+        self.anti_edit.editingFinished.connect(self._apply)
 
         self.adjustSize()
 
     def _on_keyword_toggled(self, checked):
         self.keyword_edit.setEnabled(checked)
+        self._apply()
+
+    def _on_anti_toggled(self, checked):
+        self.anti_edit.setEnabled(checked)
         self._apply()
 
     def _apply(self):
@@ -127,6 +149,8 @@ class AutoDetectPopup(QWidget):
             "keyword": self.keyword_cb.isChecked(),
             "keyword_text": self.keyword_edit.text(),
             "same_app": self.same_app_cb.isChecked(),
+            "anti": self.anti_cb.isChecked(),
+            "anti_keyword_text": self.anti_edit.text(),
         })
 
 
@@ -182,7 +206,7 @@ class AddListSection(QWidget):
         self._add_row(label)
         self._on_change()
 
-    def _add_row(self, label, auto_detect=None):
+    def _add_row(self, label, enabled=True, volume=1.0, auto_detect=None):
         auto_detect = {**DEFAULT_AUTO_DETECT, **(auto_detect or {})}
         item = QListWidgetItem(self.list_widget)
         item.setData(Qt.UserRole, auto_detect)
@@ -190,8 +214,26 @@ class AddListSection(QWidget):
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(4, 2, 4, 2)
+
+        enabled_cb = QCheckBox()
+        enabled_cb.setToolTip("Enabled -- untick to keep this configured without routing it")
+        enabled_cb.setChecked(enabled)
+        enabled_cb.toggled.connect(self._on_change)
+        row_layout.addWidget(enabled_cb)
+
         row_layout.addWidget(QLabel(label))
         row_layout.addStretch()
+
+        volume_spin = QDoubleSpinBox()
+        volume_spin.setRange(0.0, 10.0)
+        volume_spin.setSingleStep(0.1)
+        volume_spin.setDecimals(2)
+        volume_spin.setSuffix("x")
+        volume_spin.setFixedWidth(70)
+        volume_spin.setToolTip("Volume multiplier -- 1.00x leaves it alone, 2.00x doubles it, continuously enforced")
+        volume_spin.setValue(volume)
+        volume_spin.valueChanged.connect(self._on_change)
+        row_layout.addWidget(volume_spin)
 
         auto_detect_btn = QPushButton()
         auto_detect_btn.setFixedWidth(28)
@@ -206,6 +248,13 @@ class AddListSection(QWidget):
         remove_btn.setFlat(True)
         remove_btn.clicked.connect(lambda: self._remove_row(item))
         row_layout.addWidget(remove_btn)
+
+        # Stashed for items() to read back -- see items() below for why
+        # these live as attributes on the row widget rather than parsed
+        # back out of child layout positions.
+        row._conduit_enabled_cb = enabled_cb
+        row._conduit_volume_spin = volume_spin
+        row._conduit_label = label
 
         item.setSizeHint(row.sizeHint())
         self.list_widget.addItem(item)
@@ -236,14 +285,18 @@ class AddListSection(QWidget):
         return [entry["label"] for entry in self.items()]
 
     def items(self):
-        """Return [{"label": ..., "auto_detect": {...}}, ...] in display order."""
+        """Return [{"label", "enabled", "volume", "auto_detect"}, ...] in display order."""
         result = []
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             widget = self.list_widget.itemWidget(item)
-            label = widget.layout().itemAt(0).widget().text()
             auto_detect = item.data(Qt.UserRole) or dict(DEFAULT_AUTO_DETECT)
-            result.append({"label": label, "auto_detect": auto_detect})
+            result.append({
+                "label": widget._conduit_label,
+                "enabled": widget._conduit_enabled_cb.isChecked(),
+                "volume": widget._conduit_volume_spin.value(),
+                "auto_detect": auto_detect,
+            })
         return result
 
     def set_items(self, entries):
@@ -252,7 +305,12 @@ class AddListSection(QWidget):
             if isinstance(entry, str):
                 self._add_row(entry)
             else:
-                self._add_row(entry["label"], entry.get("auto_detect"))
+                self._add_row(
+                    entry["label"],
+                    entry.get("enabled", True),
+                    entry.get("volume", 1.0),
+                    entry.get("auto_detect"),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +322,7 @@ class SingleSelectSection(QWidget):
         super().__init__(parent)
         self._on_change = on_change
         self._placeholder = placeholder
+        self._value = None  # authoritative selection; the combo is just UI for it
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -271,26 +330,40 @@ class SingleSelectSection(QWidget):
 
         self.combo = QComboBox()
         self.combo.addItem(placeholder)
-        self.combo.activated.connect(lambda _: self._on_change())
+        self.combo.activated.connect(self._on_combo_activated)
         layout.addWidget(self.combo)
 
+    def _on_combo_activated(self, index):
+        text = self.combo.currentText()
+        self._value = None if text == self._placeholder else text
+        self._on_change()
+
     def set_eligible(self, labels):
-        current = self.value()
+        # Rebuild the option list, but always keep the currently-saved
+        # value present even if it isn't in this fresh live list -- a
+        # device that's momentarily unavailable (asleep, unplugged,
+        # PipeWire mid-reconfiguration) should stay configured rather
+        # than getting silently cleared just because one refresh caught
+        # it absent.
         self.combo.blockSignals(True)
         self.combo.clear()
         self.combo.addItem(self._placeholder)
-        for label in labels:
+        all_labels = list(labels)
+        if self._value and self._value not in all_labels:
+            all_labels = [self._value] + all_labels
+        for label in all_labels:
             self.combo.addItem(label)
-        if current and current in labels:
-            self.combo.setCurrentText(current)
+        self.combo.setCurrentText(self._value if self._value else self._placeholder)
         self.combo.blockSignals(False)
 
     def value(self):
-        text = self.combo.currentText()
-        return None if text == self._placeholder else text
+        return self._value
 
     def set_value(self, label):
+        self._value = label
         if label:
+            if self.combo.findText(label) == -1:
+                self.combo.addItem(label)
             self.combo.setCurrentText(label)
         else:
             self.combo.setCurrentIndex(0)
@@ -321,7 +394,12 @@ class ConduitWindow(QMainWindow):
         refresh_btn = QPushButton("Refresh devices")
         refresh_btn.clicked.connect(self.refresh_devices)
         toolbar.addWidget(refresh_btn)
+        tray_btn = QPushButton("Close to Tray")
+        tray_btn.clicked.connect(self.close_to_tray)
+        toolbar.addWidget(tray_btn)
         outer.addLayout(toolbar)
+
+        self._tray_icon = None  # created lazily on first use of close_to_tray
 
         panels = QHBoxLayout()
         outer.addLayout(panels)
@@ -354,9 +432,43 @@ class ConduitWindow(QMainWindow):
         panels.addWidget(mic_box)
 
         self._loading = True
-        self.load_state()
+        # refresh_devices() must run BEFORE load_state(): the Speakers
+        # picker's set_value() works by calling QComboBox.setCurrentText(),
+        # which silently no-ops if the combo doesn't already contain that
+        # entry. Loading state first (when the combo holds nothing but the
+        # placeholder) meant the saved bypass_target was discarded on
+        # every single launch -- populate the real device list first, then
+        # restore the selection against it.
         self.refresh_devices()
+        self.load_state()
         self._loading = False
+
+    # -- system tray ------------------------------------------------------
+
+    def close_to_tray(self):
+        if self._tray_icon is None:
+            self._tray_icon = QSystemTrayIcon(QIcon.fromTheme("conduit"), self)
+            self._tray_icon.setToolTip("Conduit")
+            menu = QMenu()
+            open_action = menu.addAction("Open Conduit")
+            open_action.triggered.connect(self._restore_from_tray)
+            quit_action = menu.addAction("Quit")
+            quit_action.triggered.connect(QApplication.instance().quit)
+            self._tray_icon.setContextMenu(menu)
+            self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+        self.hide()
+
+    def _on_tray_activated(self, reason):
+        # Trigger (left-click) toggles the window; Context (right-click)
+        # is handled separately by the menu itself.
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     # -- device list refresh --------------------------------------------
 

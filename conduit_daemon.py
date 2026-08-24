@@ -74,21 +74,23 @@ AUTO-DETECT
 -----------
 Each entry in a list carries its own "auto_detect":
 
-  {"prefix": bool, "keyword": bool, "keyword_text": str, "same_app": bool}
+  {"prefix": bool, "keyword": bool, "keyword_text": str, "same_app": bool,
+   "anti": bool, "anti_keyword_text": str}
 
 This is deliberately per-device rather than per-list -- a list often
 mixes real hardware (which never needs this) with an app-created
 virtual device (which might), and a single list-wide setting would
 apply prefix/keyword/same-app matching to entries that have nothing to
 do with each other. Every reconcile cycle, each entry's *own* label is
-always routed, and if any of its strategies are on, any other
-currently-live device matching that strategy *relative to that one
-entry* gets swept in too -- without ever being written back into the
-config. This is deliberately ephemeral: state.json (and the GUI's
-visible list) always reflects only what you explicitly added, and
-auto-detected siblings come and go from routing as PipeWire's graph
-changes, which is exactly what you want for something like Discord
-spinning up a differently-numbered capture stream per screen share.
+always routed (if the entry is enabled -- see below), and if any of
+its strategies are on, any other currently-live device matching that
+strategy *relative to that one entry* gets swept in too -- without
+ever being written back into the config. This is deliberately
+ephemeral: state.json (and the GUI's visible list) always reflects
+only what you explicitly added, and auto-detected siblings come and go
+from routing as PipeWire's graph changes, which is exactly what you
+want for something like Discord spinning up a differently-numbered
+capture stream per screen share.
 
   - prefix:   strip a trailing counter/suffix ("-2", " (3)", "#4", ...)
               from both this entry's label and a candidate's, and match
@@ -107,6 +109,33 @@ spinning up a differently-numbered capture stream per screen share.
               didn't expect, same_app will sweep it in too, since as
               far as PipeWire is concerned it genuinely is the same
               process.
+  - anti:     the inverse -- a comma-separated list of substrings
+              (case-insensitive) that, if present in a candidate's
+              label, exclude it from this entry's prefix/keyword/
+              same_app matches. Never removes the entry's own literal
+              label, only auto-detected siblings, since the point is
+              to keep an unwanted sibling out of the sweep, not to
+              undo something you added by hand.
+
+ENABLED / VOLUME
+-----------------
+Each entry also carries:
+
+  {"enabled": bool, "volume": float}
+
+"enabled": false takes an entry out of routing entirely (as if it
+weren't in the list at all, auto-detect included) without deleting
+it, so it's a one-click toggle to bring back later.
+
+"volume" is a per-device multiplier (1.0 = unchanged, 2.0 = double,
+0.5 = half), continuously re-applied via `wpctl set-volume` every
+reconcile cycle -- it always sits at exactly that level, overriding
+manual adjustments made elsewhere. A value of exactly 1.0 is treated
+as "not managing this device's volume" and is left alone entirely,
+rather than being forced back to 100% each cycle. This only applies to
+the device an entry's own label matches, not to any auto-detected
+siblings it sweeps in -- add each sibling as its own entry with its
+own volume if you want that.
 """
 
 import json
@@ -119,14 +148,19 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "conduit"
 STATE_FILE = CONFIG_DIR / "state.json"
+LINK_CACHE_FILE = CONFIG_DIR / ".link_cache.json"
 
 POLL_INTERVAL = 2  # seconds between graph reconciliation passes
+VOLUME_BOOST_LIMIT = 10.0  # ceiling passed to `wpctl set-volume -l`, allows >100%
 
 VIRTUAL_SPEAKER = "conduit_virtual_speaker"
 VIRTUAL_MIC = "conduit_virtual_mic"
 _OUR_VIRTUAL_NODE_NAMES = {VIRTUAL_SPEAKER, VIRTUAL_MIC}
 
-DEFAULT_AUTO_DETECT = {"prefix": False, "keyword": False, "keyword_text": "", "same_app": False}
+DEFAULT_AUTO_DETECT = {
+    "prefix": False, "keyword": False, "keyword_text": "", "same_app": False,
+    "anti": False, "anti_keyword_text": "",
+}
 
 DEFAULT_STATE = {
     "mic": {"inputs": [], "outputs": []},
@@ -145,19 +179,26 @@ def ensure_config_exists():
 
 
 def _migrate_items(loaded):
-    """Normalize a config list to [{"label": ..., "auto_detect": {...}}, ...],
-    transparently handling every prior on-disk shape rather than discarding
-    an already-working config:
+    """Normalize a config list to
+    [{"label", "enabled", "volume", "auto_detect"}, ...], transparently
+    handling every prior on-disk shape rather than discarding an
+    already-working config:
       - flat list of strings (original format, pre auto-detect)
       - {"items": [...strings...], "auto_detect": {...}} (short-lived
         list-wide auto-detect format)
-      - already-current list of {"label", "auto_detect"} dicts
+      - list of {"label", "auto_detect"} dicts (pre enabled/volume)
+      - already-current list of {"label", "enabled", "volume", "auto_detect"} dicts
     """
-    def fresh_entry(label, auto_detect_seed=None):
+    def fresh_entry(label, auto_detect_seed=None, enabled=True, volume=1.0):
         ad = dict(DEFAULT_AUTO_DETECT)
         if isinstance(auto_detect_seed, dict):
-            ad.update(auto_detect_seed)
-        return {"label": label, "auto_detect": ad}
+            ad.update({k: v for k, v in auto_detect_seed.items() if k in DEFAULT_AUTO_DETECT})
+        return {
+            "label": label,
+            "enabled": bool(enabled) if isinstance(enabled, bool) else True,
+            "volume": float(volume) if isinstance(volume, (int, float)) else 1.0,
+            "auto_detect": ad,
+        }
 
     if isinstance(loaded, list):
         result = []
@@ -165,7 +206,10 @@ def _migrate_items(loaded):
             if isinstance(entry, str):
                 result.append(fresh_entry(entry))
             elif isinstance(entry, dict) and isinstance(entry.get("label"), str):
-                result.append(fresh_entry(entry["label"], entry.get("auto_detect")))
+                result.append(fresh_entry(
+                    entry["label"], entry.get("auto_detect"),
+                    entry.get("enabled", True), entry.get("volume", 1.0),
+                ))
         return result
 
     if isinstance(loaded, dict) and isinstance(loaded.get("items"), list):
@@ -394,15 +438,28 @@ def expand_item_auto_detect(label, auto_detect, nodes, predicate):
                 if node.client_id in seed_client_ids:
                     result.add(node.display_label)
 
+    # Anti-Auto-Detect: drop any AUTO-DETECTED sibling matching an
+    # excluded keyword. Never removes the entry's own label -- that was
+    # added by hand, not swept in, so it's out of scope for exclusion.
+    anti_terms = [t.strip().lower() for t in (auto_detect.get("anti_keyword_text") or "").split(",") if t.strip()]
+    if auto_detect.get("anti") and anti_terms:
+        result = {
+            item for item in result
+            if item == label or not any(term in item.lower() for term in anti_terms)
+        }
+
     return result
 
 
 def expand_items(entries, nodes, predicate):
-    """Union expand_item_auto_detect() over every {"label", "auto_detect"}
-    entry in a list -- the full effective label set to route for that
-    whole section."""
+    """Union expand_item_auto_detect() over every enabled entry in a list
+    -- the full effective label set to route for that whole section.
+    Disabled entries are skipped entirely, auto-detect sweep included,
+    as if they weren't in the list at all."""
     result = set()
     for entry in entries:
+        if not entry.get("enabled", True):
+            continue
         result |= expand_item_auto_detect(entry["label"], entry.get("auto_detect", DEFAULT_AUTO_DETECT), nodes, predicate)
     return result
 
@@ -510,6 +567,21 @@ def compute_desired_links(state, nodes):
     return desired, managed_node_pairs
 
 
+def _load_link_cache():
+    try:
+        data = json.loads(LINK_CACHE_FILE.read_text())
+        return {tuple(pair) for pair in data if isinstance(pair, list) and len(pair) == 2}
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return set()
+
+
+def _save_link_cache(pairs):
+    try:
+        LINK_CACHE_FILE.write_text(json.dumps([list(p) for p in pairs]))
+    except OSError:
+        pass
+
+
 def reconcile(state, nodes, dump):
     desired, managed_pairs = compute_desired_links(state, nodes)
     existing = current_links(dump)
@@ -523,14 +595,31 @@ def reconcile(state, nodes, dump):
         for pid, _ in node.input_ports:
             port_owner[pid] = node.id
 
+    # Undo-on-remove: a pair stops appearing in managed_pairs the instant
+    # its config entry is removed or disabled, so pruning against
+    # managed_pairs alone would leave that stale link connected forever
+    # (nothing keeps recomputing "this used to be managed" once the entry
+    # is gone). The GUI restarts this daemon on every edit too, so there's
+    # no in-memory history to fall back on -- instead, the previous
+    # cycle's managed_pairs is cached to disk and unioned in here, then
+    # replaced with THIS cycle's fresh set at the end. A removed entry's
+    # pair rides along for exactly one more cycle (enough to get pruned)
+    # and then drops out of the cache on its own. Node ids are stable
+    # within a single PipeWire session, so this survives daemon restarts
+    # without needing to survive -- or caring about surviving -- a reboot.
+    cached_pairs = _load_link_cache()
+    prunable_pairs = managed_pairs | cached_pairs
+
     for out_port, in_port in existing:
         pair = (port_owner.get(out_port), port_owner.get(in_port))
-        if pair in managed_pairs and (out_port, in_port) not in desired:
+        if pair in prunable_pairs and (out_port, in_port) not in desired:
             pw_unlink(out_port, in_port)
 
     for out_port, in_port in desired:
         if (out_port, in_port) not in existing:
             pw_link(out_port, in_port)
+
+    _save_link_cache(managed_pairs)
 
 
 def enforce_defaults(nodes):
@@ -540,6 +629,34 @@ def enforce_defaults(nodes):
         subprocess.run(["wpctl", "set-default", str(virtual_speaker.id)], capture_output=True)
     if virtual_mic:
         subprocess.run(["wpctl", "set-default", str(virtual_mic.id)], capture_output=True)
+
+
+def enforce_volumes(state, nodes):
+    """Continuously pin each enabled entry's volume multiplier (see the
+    ENABLED / VOLUME section in the module docstring). Applies only to
+    the device an entry's own label matches -- not to any auto-detected
+    siblings -- and only when volume != 1.0, since 1.0 means "not
+    managing this device's volume" rather than "force it to 100%"."""
+    all_entries = (
+        [(e, is_producer) for e in state["mic"]["inputs"]] +
+        [(e, is_consumer) for e in state["mic"]["outputs"]] +
+        [(e, is_producer) for e in state["speaker"]["inputs"]] +
+        [(e, is_consumer) for e in state["speaker"]["outputs"]] +
+        [(e, is_producer) for e in state["speaker"]["bypass"]]
+    )
+    for entry, predicate in all_entries:
+        if not entry.get("enabled", True):
+            continue
+        volume = entry.get("volume", 1.0)
+        if volume == 1.0:
+            continue
+        node = find_node(nodes, entry["label"], predicate)
+        if node is None:
+            continue
+        subprocess.run(
+            ["wpctl", "set-volume", str(node.id), f"{volume}", "-l", str(VOLUME_BOOST_LIMIT)],
+            capture_output=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +690,7 @@ def main():
                     printed_inventory = True
 
                 enforce_defaults(nodes)
+                enforce_volumes(state, nodes)
                 reconcile(state, nodes, dump)
         except Exception:
             # Belt-and-suspenders: a silently-dying loop is much harder to
