@@ -90,9 +90,10 @@ Two panels: **Speaker** on the left, **Microphone** on the right.
   and it's added to the list below; click the ✕ on a row to remove it.
 - **Speaker → Bypass**: pick an app here and it's disconnected from
   the virtual speaker entirely, forced instead onto whatever's chosen
-  in the **Speakers** dropdown right below it (a single-device picker,
-  not a list).
-- **Speaker → Output** and **Bypass target (Speakers)** aren't limited
+  in the **Destination** dropdown right next to it (a single-device
+  picker, not a list) -- the two sit side by side since Destination
+  only does anything in conjunction with Bypass.
+- **Speaker → Output** and **Bypass → Destination** aren't limited
   to physical hardware -- an app that wants to consume your mix (e.g.
   Discord's screen-share audio capture) is fair game for Output too.
   The Speakers picker specifically stays hardware-only, since that's
@@ -172,7 +173,7 @@ Two panels: **Speaker** on the left, **Microphone** on the right.
 1. Open Spotify and start playing something (so it shows up as an
    eligible device).
 2. In the **Speaker** panel, pick **Analog Stereo Speakers** (or
-   whatever your real output is called) in the **Speakers** dropdown.
+   whatever your real output is called) in the **Destination** dropdown.
 3. Pick **Spotify** in the **Bypass** dropdown.
 
 Spotify now goes straight to your real speakers; everything else you
@@ -209,10 +210,12 @@ your NixOS config — they're created and destroyed live by the daemon
 at runtime, so there's no rebuild step for adding, renaming, or
 removing one. The trade-off: if the daemon isn't running (crashed,
 mid-restart), a Custom Conduit's underlying device doesn't exist
-either. Renaming one only updates Conduit's own display — it doesn't
-touch the live PipeWire node's description, so a separate tool like
-qpwgraph will keep showing whatever name it had when created.
-
+either. Renaming takes effect within a couple of seconds -- PipeWire
+doesn't support changing a live node's name in place, so under the
+hood this is a quick destroy-and-recreate with the new name; any
+connections through it get torn down and rebuilt automatically as
+part of that, the same brief interruption any other config change
+already causes.
 ## Noise Suppression
 
 Unlike everything else in this app, Noise Suppression needs a one-time

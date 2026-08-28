@@ -933,30 +933,60 @@ def compute_desired_links(state, nodes):
 
 def sync_custom_conduits(state, nodes):
     """Ensure every configured custom conduit's underlying PipeWire
-    node(s) exist, and destroy any leftover ones that are no longer
-    configured (a whole conduit deleted, or as_microphone turned back
-    off). Nodes created here won't be visible until the NEXT cycle's
-    fresh pw-dump -- fine, since this loop runs continuously anyway."""
+    node(s) exist with the currently-configured name, and destroy any
+    leftover ones that are no longer configured (a whole conduit
+    deleted, or as_microphone turned back off). Nodes created here won't
+    be visible until the NEXT cycle's fresh pw-dump -- fine, since this
+    loop runs continuously anyway.
+
+    node.description is set once at creation and PipeWire doesn't
+    support changing it on a live node, so a rename is handled as
+    destroy-then-recreate with the same technical node.name (which is
+    what routing actually keys off, so nothing else needs to change) --
+    any links to it get torn down and rebuilt by the next reconcile
+    cycle via the usual undo-on-remove link cache, same as any other
+    config edit."""
     configured = state.get("custom", {}).get("conduits", [])
     expected_names = set()
     for conduit in configured:
         base_name = custom_node_name(conduit["id"])
         expected_names.add(base_name)
-        if find_virtual(nodes, base_name) is None:
-            _create_dynamic_node(base_name, conduit.get("name", base_name), "Audio/Sink")
+        desired_desc = conduit.get("name", base_name)
+        base_node = find_virtual(nodes, base_name)
+        if base_node is None:
+            _create_dynamic_node(base_name, desired_desc, "Audio/Sink")
+        elif base_node.description != _sanitize_description(desired_desc):
+            _destroy_dynamic_node(base_node.id, base_name)
+            _create_dynamic_node(base_name, desired_desc, "Audio/Sink")
+
         if conduit.get("as_microphone"):
             mic_name = custom_mic_node_name(conduit["id"])
             expected_names.add(mic_name)
-            if find_virtual(nodes, mic_name) is None:
-                _create_dynamic_node(mic_name, f"{conduit.get('name', mic_name)} (Mic)", "Audio/Source/Virtual")
+            desired_mic_desc = f"{desired_desc} (Mic)"
+            mic_node = find_virtual(nodes, mic_name)
+            if mic_node is None:
+                _create_dynamic_node(mic_name, desired_mic_desc, "Audio/Source/Virtual")
+            elif mic_node.description != _sanitize_description(desired_mic_desc):
+                _destroy_dynamic_node(mic_node.id, mic_name)
+                _create_dynamic_node(mic_name, desired_mic_desc, "Audio/Source/Virtual")
 
     for node in list(nodes.values()):
         if node.name.startswith(_CUSTOM_NODE_PREFIX) and node.name not in expected_names:
             _destroy_dynamic_node(node.id, node.name)
 
 
+def _sanitize_description(description):
+    """Same sanitization _create_dynamic_node applies before handing a
+    description to pw-cli -- kept as its own function so sync_custom_
+    conduits can compare against a live node's actual description using
+    the exact same transform, rather than comparing against the raw
+    (potentially still-quoted) configured name and false-triggering a
+    rename loop every cycle."""
+    return description.replace('"', "'")
+
+
 def _create_dynamic_node(node_name, description, media_class):
-    description = description.replace('"', "'")
+    description = _sanitize_description(description)
     args = (
         "{ factory.name=support.null-audio-sink "
         f'node.name="{node_name}" node.description="{description}" '

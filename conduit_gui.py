@@ -39,8 +39,17 @@ from PySide6.QtWidgets import (
 )
 
 PLACEHOLDER = "Add a device or app…"
-SPEAKERS_PLACEHOLDER = "Select speakers…"
+DESTINATION_PLACEHOLDER = "Select destination…"
 RESTART_DEBOUNCE_MS = 600
+
+
+class NoScrollComboBox(QComboBox):
+    """A QComboBox that ignores mouse-wheel events instead of changing its
+    selection -- the default Qt behavior changes the selected item on
+    scroll even when the dropdown isn't open, which is surprising and
+    easy to trigger by accident while scrolling past one in a list."""
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +197,7 @@ class NoiseSuppressionPopup(QWidget):
         note.setMaximumWidth(240)
         layout.addWidget(note)
 
-        self.combo = QComboBox()
+        self.combo = NoScrollComboBox()
         for key, label in NOISE_SUPPRESSION_LABELS:
             self.combo.addItem(label, key)
         idx = self.combo.findData(current_method)
@@ -219,12 +228,13 @@ class AddListSection(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        layout.addWidget(QLabel(f"<b>{title}</b>"))
-
-        self.combo = QComboBox()
+        header = QHBoxLayout()
+        header.addWidget(QLabel(f"<b>{title}</b>"))
+        self.combo = NoScrollComboBox()
         self.combo.addItem(PLACEHOLDER)
         self.combo.activated.connect(self._on_combo_activated)
-        layout.addWidget(self.combo)
+        header.addWidget(self.combo, 1)
+        layout.addLayout(header)
 
         self.list_widget = QListWidget()
         self.list_widget.setMaximumHeight(110)
@@ -384,12 +394,14 @@ class SingleSelectSection(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(f"<b>{title}</b>"))
+        header = QHBoxLayout()
+        header.addWidget(QLabel(f"<b>{title}</b>"))
 
-        self.combo = QComboBox()
+        self.combo = NoScrollComboBox()
         self.combo.addItem(placeholder)
         self.combo.activated.connect(self._on_combo_activated)
-        layout.addWidget(self.combo)
+        header.addWidget(self.combo, 1)
+        layout.addLayout(header)
 
     def _on_combo_activated(self, index):
         text = self.combo.currentText()
@@ -440,6 +452,7 @@ class CustomConduitBox(QFrame):
         self.conduit_id = conduit_id
         self._on_change = on_change
         self.setFrameShape(QFrame.StyledPanel)
+        self.setFixedWidth(380)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -546,7 +559,7 @@ class ConduitWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Conduit")
         self.setWindowIcon(QIcon.fromTheme("conduit"))
-        self.resize(900, 760)
+        self.resize(980, 760)
 
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
@@ -587,13 +600,15 @@ class ConduitWindow(QMainWindow):
         self.speaker_inputs = AddListSection("Input", self._save)
         self.speaker_outputs = AddListSection("Output", self._save)
         self.speaker_bypass = AddListSection("Bypass", self._save)
-        self.speakers_target = SingleSelectSection("Speakers", SPEAKERS_PLACEHOLDER, self._save)
+        self.speakers_target = SingleSelectSection("Destination", DESTINATION_PLACEHOLDER, self._save)
         speaker_layout.addWidget(self.speaker_inputs)
         speaker_layout.addWidget(_hline())
         speaker_layout.addWidget(self.speaker_outputs)
         speaker_layout.addWidget(_hline())
-        speaker_layout.addWidget(self.speaker_bypass)
-        speaker_layout.addWidget(self.speakers_target)
+        bypass_row = QHBoxLayout()
+        bypass_row.addWidget(self.speaker_bypass)
+        bypass_row.addWidget(self.speakers_target)
+        speaker_layout.addLayout(bypass_row)
         speaker_layout.addStretch()
         panels.addWidget(speaker_box)
 
@@ -631,14 +646,15 @@ class ConduitWindow(QMainWindow):
         custom_outer.addLayout(custom_header)
 
         self._custom_container = QWidget()
-        self._custom_container_layout = QVBoxLayout(self._custom_container)
+        self._custom_container_layout = QHBoxLayout(self._custom_container)
         self._custom_container_layout.setContentsMargins(0, 0, 0, 0)
         self._custom_container_layout.addStretch()
 
         custom_scroll = QScrollArea()
         custom_scroll.setWidgetResizable(True)
         custom_scroll.setWidget(self._custom_container)
-        custom_scroll.setMinimumHeight(180)
+        custom_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        custom_scroll.setFixedHeight(300)
         custom_outer.addWidget(custom_scroll)
 
         outer.addWidget(custom_box)
