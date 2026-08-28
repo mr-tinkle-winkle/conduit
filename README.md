@@ -130,12 +130,29 @@ Two panels: **Speaker** on the left, **Microphone** on the right.
   it always sits at exactly that level and overrides any manual
   adjustment you make elsewhere (a system volume mixer, the app's own
   volume slider, etc.). Only affects the exact device a row is saved
-  as, not any auto-detected siblings it sweeps in.
+  as, not any auto-detected siblings it sweeps in. Each row's multiplier
+  is fully independent, even for the same physical device added in two
+  different lists -- under the hood, a non-1.00x row gets its own tiny
+  dedicated volume-adjustment device inserted inline, rather than
+  changing the shared device's own volume (which would mean two
+  different multipliers on the same device fighting each other).
 - **Removing a device actually undoes its connections.** Conduit
   remembers what it last connected across daemon restarts (which
   happen on every save), so taking something out of a list -- or just
   unticking its enable checkbox -- tears down the link it created
   instead of leaving it connected until the next reboot.
+- **Auto Refresh Devices**, next to the manual Refresh button,
+  periodically re-checks for new/gone devices on its own (every few
+  seconds) instead of only refreshing when you click the button.
+- **Mono**, on every device row, treats that device as single-channel --
+  fanning it out to both stereo channels on the other side (or summing
+  a stereo signal down to it), instead of the normal one-to-one channel
+  matching that can otherwise leave one side silent for a genuinely
+  mono microphone.
+- **Noise Suppression**, on the Microphone panel and on any Custom
+  Conduit with "As Microphone" ticked, offers RNNoise or WebRTC's
+  built-in noise suppression. This one needs an extra step -- see
+  below.
 - **Close to Tray** hides the window and keeps the daemon-adjacent GUI
   running in the system tray rather than quitting; click the tray icon
   (or its "Open Conduit" menu entry) to bring the window back, or
@@ -160,6 +177,79 @@ Two panels: **Speaker** on the left, **Microphone** on the right.
 
 Spotify now goes straight to your real speakers; everything else you
 route through the virtual speaker still gets mixed normally.
+
+## Custom Conduits
+
+Below the Speaker and Microphone panels, **Custom Connection** lets
+you build your own virtual patch points — click **+** to add one.
+Each Custom Conduit gets:
+
+- **A name** — click it and type; it saves when you click away or hit
+  Enter.
+- **As Speaker** / **As Microphone** — independently checkable.
+  "As Speaker" doesn't need to do much: the conduit is already a
+  Sink-style device structurally (same as the main Virtual Speaker),
+  so it may appear as a selectable output regardless of this box —
+  there's no reliable cross-desktop way to hide a Sink-classed node
+  from speaker pickers. "As Microphone" is where it actually does
+  something: it creates a second, linked device that taps whatever
+  the conduit is carrying and exposes it as a recording device — the
+  classic "Stereo Mix" pattern (route game audio into the conduit, get
+  it back out both to real speakers *and* as a mic input for Discord).
+- **Its own Input and Output lists** — identical in every way to the
+  Speaker/Mic panels' lists (enable checkbox, volume multiplier,
+  Auto-Detect popup, all of it). Route anything into a conduit, then
+  out to anything else, including chaining one custom conduit into
+  another.
+- **✕ Remove** deletes the whole conduit and tears down its
+  connections.
+
+Unlike the two fixed virtual devices, Custom Conduits aren't part of
+your NixOS config — they're created and destroyed live by the daemon
+at runtime, so there's no rebuild step for adding, renaming, or
+removing one. The trade-off: if the daemon isn't running (crashed,
+mid-restart), a Custom Conduit's underlying device doesn't exist
+either. Renaming one only updates Conduit's own display — it doesn't
+touch the live PipeWire node's description, so a separate tool like
+qpwgraph will keep showing whatever name it had when created.
+
+## Noise Suppression
+
+Unlike everything else in this app, Noise Suppression needs a one-time
+opt-in in your NixOS config before it's usable at all — the actual DSP
+(RNNoise, WebRTC) is too complex to trust loading live at runtime the
+way Custom Conduits' plain patch-point nodes do, so it's declared
+statically instead, the same safe pattern as the two main virtual
+devices:
+
+```nix
+services.conduit.noiseSuppression.enable = true;
+```
+
+Rebuild, and the "Noise Suppression" button on the Microphone panel
+(and on any Custom Conduit with "As Microphone" ticked) becomes
+functional — picking a method there is instant after that, no further
+rebuilds needed.
+
+- **RNNoise** — a dedicated neural-network denoiser (needs nixpkgs'
+  `rnnoise-plugin` package, pulled in automatically once the option
+  above is enabled). The better-quality option.
+- **WebRTC** — PipeWire's built-in noise suppression, no extra package
+  needed, but per real-world reports noticeably weaker than RNNoise.
+  Included as a no-extra-dependency fallback.
+
+Under the hood, this reserves a small fixed pool of processors (4 of
+each method by default — `services.conduit.noiseSuppression.poolSize`
+to change it) rather than one per user, since the number of Custom
+Conduits is unbounded but the statically-declared processors aren't.
+Realistically this only matters if you have more than 4 things
+simultaneously wanting the *same* method at once — the Virtual Mic
+plus several Custom Conduits, say.
+
+For the Microphone panel specifically, turning this on doesn't just
+affect explicit **Output** entries — it also becomes what apps get
+when they simply select "Conduit Virtual Mic" as their default input
+device, so it doesn't matter which way an app reaches the mic.
 
 ## Troubleshooting
 
@@ -229,30 +319,47 @@ changes:
         "label": "Blue Yeti Analog Stereo",
         "enabled": true,
         "volume": 1.0,
+        "mono": true,
         "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}
       }
     ],
-    "outputs": []
+    "outputs": [],
+    "noise_suppression": "rnnoise"
   },
   "speaker": {
     "inputs": [],
     "outputs": [
-      {"label": "Analog Stereo Speakers", "enabled": true, "volume": 1.0, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}},
-      {"label": "vencord-screen-share", "enabled": true, "volume": 1.0, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": true, "anti": true, "anti_keyword_text": "mic"}}
+      {"label": "Analog Stereo Speakers", "enabled": true, "volume": 1.0, "mono": false, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}},
+      {"label": "vencord-screen-share", "enabled": true, "volume": 1.0, "mono": false, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": true, "anti": true, "anti_keyword_text": "mic"}}
     ],
     "bypass": [
-      {"label": "Spotify", "enabled": true, "volume": 1.5, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}}
+      {"label": "Spotify", "enabled": true, "volume": 1.5, "mono": false, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}}
     ],
     "bypass_target": "Analog Stereo Speakers"
+  },
+  "custom": {
+    "next_id": 2,
+    "conduits": [
+      {
+        "id": 1,
+        "name": "Game Audio Mix",
+        "as_speaker": true,
+        "as_microphone": true,
+        "mic_noise_suppression": "webrtc",
+        "inputs": [],
+        "outputs": []
+      }
+    ]
   }
 }
 ```
 
 Devices are matched by their `node.description` (stable across boots
 for the same hardware); apps are matched by `application.name`. Older
-configs from earlier Conduit versions (missing `enabled`/`volume`, a
-flat list of strings, or a short-lived list-wide auto-detect format)
-are migrated automatically on next load -- no manual edits needed.
+configs from earlier Conduit versions (missing `enabled`/`volume`/
+`mono`, a flat list of strings, or a short-lived list-wide auto-detect
+format) are migrated automatically on next load -- no manual edits
+needed.
 There's also a small internal `~/.config/conduit/.link_cache.json` the
 daemon uses to track what it last connected across restarts, so it can
 undo stale links when you remove or disable something -- not meant to

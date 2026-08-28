@@ -78,6 +78,71 @@ let
     categories = [ "AudioVideo" "Audio" ];
   };
 
+  # A fixed-size pool of noise-suppression processors per method, rather
+  # than one dynamically created per consumer -- this keeps the DSP part
+  # (the genuinely complex bit, filter-chain plugin graphs) in the same
+  # statically-declared, once-verified pattern as the two main virtual
+  # devices, instead of attempting to load filter-chain modules live at
+  # runtime the way Custom Conduits create their plain adapter nodes.
+  # The daemon allocates a free slot to whatever currently wants it and
+  # links through it -- see conduit_daemon.py's NOISE SUPPRESSION
+  # section. 4 of each is enough for realistic simultaneous use (the
+  # Virtual Mic plus a few Custom Conduits); raise noiseSuppressionPoolSize
+  # if you genuinely need more.
+  noiseSuppressionPoolSize = cfg.noiseSuppression.poolSize;
+
+  # RNNoise (via the LADSPA plugin in nixpkgs' rnnoise-plugin package) --
+  # the higher-quality of the two options, a dedicated neural-network
+  # denoiser with no other side effects.
+  rnnoiseProcessors = lib.genList (i:
+    let n = toString (i + 1); in {
+      name = "libpipewire-module-filter-chain";
+      args = {
+        "node.description" = "Conduit Noise Suppression (RNNoise) ${n}";
+        "filter.graph" = {
+          nodes = [{
+            type = "ladspa";
+            name = "rnnoise";
+            plugin = "${pkgs.rnnoise-plugin.ladspa}/lib/ladspa/librnnoise_ladspa.so";
+            label = "noise_suppressor_stereo";
+            control = { "VAD Threshold (%)" = 50.0; };
+          }];
+        };
+        "capture.props" = {
+          "node.name" = "conduit_ns_rnnoise_${n}_in";
+          "media.class" = "Audio/Sink";
+          "audio.position" = [ "FL" "FR" ];
+        };
+        "playback.props" = {
+          "node.name" = "conduit_ns_rnnoise_${n}_out";
+          "media.class" = "Audio/Source";
+          "audio.position" = [ "FL" "FR" ];
+        };
+      };
+    }
+  ) noiseSuppressionPoolSize;
+
+  # WebRTC's built-in noise suppression, riding on PipeWire's own
+  # echo-cancel module rather than a separate plugin -- no extra package
+  # needed, but per real-world reports it's noticeably weaker than
+  # RNNoise (see README). Used here in "standalone" mode: the
+  # sink/playback side that would normally carry the echo-reference
+  # signal is left completely unconnected, so nothing is actually
+  # echo-cancelled -- only the webrtc.noise_suppression effect applies.
+  webrtcProcessors = lib.genList (i:
+    let n = toString (i + 1); in {
+      name = "libpipewire-module-echo-cancel";
+      args = {
+        "library.name" = "aec/libspa-aec-webrtc";
+        "aec.args" = "webrtc.noise_suppression=true webrtc.gain_control=true webrtc.high_pass_filter=true webrtc.voice_detection=false";
+        "capture.props" = { "node.name" = "conduit_ns_webrtc_${n}_in"; "node.passive" = true; };
+        "source.props" = { "node.name" = "conduit_ns_webrtc_${n}_out"; };
+        "sink.props" = { "node.name" = "conduit_ns_webrtc_${n}_sink_unused"; "node.passive" = true; };
+        "playback.props" = { "node.name" = "conduit_ns_webrtc_${n}_playback_unused"; "node.passive" = true; };
+      };
+    }
+  ) noiseSuppressionPoolSize;
+
 in
 {
   options.services.conduit = {
@@ -91,6 +156,25 @@ in
         PipeWire session Conduit manages. Should be the user who logs
         into the graphical session.
       '';
+    };
+
+    noiseSuppression = {
+      enable = lib.mkEnableOption ''
+        the Noise Suppression option in the Virtual Mic / Custom Conduit
+        popups, backed by a fixed pool of statically-declared RNNoise and
+        WebRTC-noise-suppression processors
+      '';
+
+      poolSize = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 4;
+        description = ''
+          How many simultaneous users of EACH method (RNNoise, WebRTC)
+          to provision for. Only the Virtual Mic and Custom Conduits with
+          "As Microphone" ticked can request noise suppression, so this
+          rarely needs to be more than a handful.
+        '';
+      };
     };
   };
 
@@ -154,6 +238,14 @@ in
         }
       ];
     };
+
+    # Only declared when explicitly opted into -- pulls in the
+    # rnnoise-plugin package and creates 2*poolSize extra PipeWire nodes
+    # that most people won't want by default.
+    services.pipewire.extraConfig.pipewire."11-conduit-noise-suppression" =
+      lib.mkIf cfg.noiseSuppression.enable {
+        "context.modules" = rnnoiseProcessors ++ webrtcProcessors;
+      };
 
     # Ship both scripts declaratively, same as Puppetry -- the GUI
     # imports the daemon module at runtime, so both need to land

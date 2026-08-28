@@ -132,12 +132,98 @@ it, so it's a one-click toggle to bring back later.
 reconcile cycle -- it always sits at exactly that level, overriding
 manual adjustments made elsewhere. A value of exactly 1.0 is treated
 as "not managing this device's volume" and is left alone entirely,
-rather than being forced back to 100% each cycle. This only applies to
-the device an entry's own label matches, not to any auto-detected
-siblings it sweeps in -- add each sibling as its own entry with its
-own volume if you want that.
+CUSTOM CONDUITS
+---------------
+A "Custom Conduit" is a user-created virtual patch point, distinct
+from the two fixed devices above (which come from your NixOS config
+and never change without a rebuild). Since these are created and
+renamed live from the GUI with no rebuild step, the daemon itself
+creates and destroys the underlying PipeWire nodes at runtime, via
+`pw-cli create-node` / `pw-cli destroy` -- the same
+adapter+support.null-audio-sink building block module.nix uses
+statically, just invoked live instead of declared once at boot.
+
+  "custom": {
+    "next_id": 2,
+    "conduits": [
+      {
+        "id": 1,
+        "name": "Custom Conduit 1",
+        "as_speaker": true,
+        "as_microphone": false,
+        "inputs": [...same shape as any other list...],
+        "outputs": [...same shape as any other list...]
+      }
+    ]
+  }
+
+"id" is permanent and never reused, even after the conduit is deleted
+(that's what "next_id" tracks) -- it's what derives the underlying
+node's stable technical name (conduit_custom_<id>), decoupled from the
+user-facing "name", which is purely a Conduit-side label. Renaming a
+conduit only updates that label; it doesn't touch the live PipeWire
+node (so a third-party tool like qpwgraph will keep showing whatever
+description it had at creation time -- a deliberate, documented
+trade-off in exchange for renaming being instant and never needing to
+tear down an existing conduit's connections just to relabel it).
+
+Every conduit always gets one real underlying node --
+"conduit_custom_<id>", media.class Audio/Sink -- which is where its
+own Input list feeds in and its own Output list is read from, exactly
+like the main Virtual Speaker. That's what "as_speaker" describes: it
+comes structurally free just from being a sink-style patch point (the
+checkbox doesn't need to add anything -- there's currently no reliable
+cross-desktop way to make a Sink-classed node NOT show up as a
+selectable output device, so it may appear in speaker pickers whether
+or not the box is ticked; this is an honest limitation, not a bug).
+
+"as_microphone" is where the two checkboxes actually diverge: ticking
+it creates a SECOND, lightweight node -- "conduit_custom_<id>_mic",
+media.class Audio/Source/Virtual -- and links the primary node's
+monitor ports into it. That second node doesn't do any mixing of its
+own; it's a passive tap on whatever the primary node is already
+carrying, so apps can select it as a "microphone" and hear the exact
+same signal the conduit's Output list is also sending elsewhere (the
+classic "Stereo Mix" pattern). Unticking it destroys that second node.
+
+Every reconcile cycle, any live node named "conduit_custom_*" that no
+longer corresponds to a configured conduit (or a still-enabled
+as_microphone flag) gets destroyed -- this is what cleans up after a
+whole conduit is deleted, or after as_microphone is turned back off.
+
+NOISE SUPPRESSION
+-----------------
+Only the Virtual Mic and a Custom Conduit with "As Microphone" ticked
+can request this (state["mic"]["noise_suppression"] and each custom
+conduit's "mic_noise_suppression", both "none" | "rnnoise" | "webrtc").
+Unlike everything else that's created dynamically, the actual DSP
+processors are a FIXED POOL of statically nix-declared nodes (see
+module.nix's noiseSuppression option) -- filter-chain plugin graphs are
+too complex to trust loading dynamically without a live PipeWire
+instance to verify against, unlike the simple adapter nodes Custom
+Conduits and gain nodes use. The daemon's job is just to allocate a
+free pool slot to whoever's asking and route through it -- plain
+pw-link rewiring, the same mechanism proven everywhere else in this
+file.
+
+For the Virtual Mic specifically, the processor's OUTPUT node becomes
+the system default audio source (instead of Virtual Mic itself) and
+the target for any mic.outputs entries -- so it doesn't matter whether
+an app reaches the mic by picking "the default" or by an explicit
+route Conduit set up, either way it gets denoised audio. For a Custom
+Conduit, the processor sits between the base node and the as_microphone
+tap node instead of the tap linking directly to the base.
+
+Slot assignment is a simple sorted-list index over current requesters,
+recomputed fresh each cycle -- simple, but means an unrelated
+requester's slot CAN shift (a brief relink) when the SET of active
+requesters changes, not just when its own request changes. Given this
+is realistically used by a handful of things at once, that's an
+accepted tradeoff rather than something worth persisting slot
+assignments to avoid.
 """
 
+import hashlib
 import json
 import re
 import subprocess
@@ -156,6 +242,7 @@ VOLUME_BOOST_LIMIT = 10.0  # ceiling passed to `wpctl set-volume -l`, allows >10
 VIRTUAL_SPEAKER = "conduit_virtual_speaker"
 VIRTUAL_MIC = "conduit_virtual_mic"
 _OUR_VIRTUAL_NODE_NAMES = {VIRTUAL_SPEAKER, VIRTUAL_MIC}
+_CUSTOM_NODE_PREFIX = "conduit_custom_"
 
 DEFAULT_AUTO_DETECT = {
     "prefix": False, "keyword": False, "keyword_text": "", "same_app": False,
@@ -163,9 +250,28 @@ DEFAULT_AUTO_DETECT = {
 }
 
 DEFAULT_STATE = {
-    "mic": {"inputs": [], "outputs": []},
+    "mic": {"inputs": [], "outputs": [], "noise_suppression": "none"},
     "speaker": {"inputs": [], "outputs": [], "bypass": [], "bypass_target": None},
+    "custom": {"next_id": 1, "conduits": []},
 }
+
+# Must match module.nix's services.conduit.noiseSuppression.poolSize
+# (default there is also 4) -- these are two sides of the same
+# statically-declared pool, so they have to agree on its size.
+NOISE_SUPPRESSION_METHODS = ("rnnoise", "webrtc")
+NOISE_SUPPRESSION_POOL_SIZE = 4
+
+
+def noise_processor_names(method, slot):
+    return (f"conduit_ns_{method}_{slot}_in", f"conduit_ns_{method}_{slot}_out")
+
+
+def custom_node_name(conduit_id):
+    return f"{_CUSTOM_NODE_PREFIX}{conduit_id}"
+
+
+def custom_mic_node_name(conduit_id):
+    return f"{_CUSTOM_NODE_PREFIX}{conduit_id}_mic"
 
 
 # ---------------------------------------------------------------------------
@@ -180,16 +286,17 @@ def ensure_config_exists():
 
 def _migrate_items(loaded):
     """Normalize a config list to
-    [{"label", "enabled", "volume", "auto_detect"}, ...], transparently
+    [{"label", "enabled", "volume", "mono", "auto_detect"}, ...], transparently
     handling every prior on-disk shape rather than discarding an
     already-working config:
       - flat list of strings (original format, pre auto-detect)
       - {"items": [...strings...], "auto_detect": {...}} (short-lived
         list-wide auto-detect format)
       - list of {"label", "auto_detect"} dicts (pre enabled/volume)
-      - already-current list of {"label", "enabled", "volume", "auto_detect"} dicts
+      - list of {"label", "enabled", "volume", "auto_detect"} dicts (pre mono)
+      - already-current list of {"label", "enabled", "volume", "mono", "auto_detect"} dicts
     """
-    def fresh_entry(label, auto_detect_seed=None, enabled=True, volume=1.0):
+    def fresh_entry(label, auto_detect_seed=None, enabled=True, volume=1.0, mono=False):
         ad = dict(DEFAULT_AUTO_DETECT)
         if isinstance(auto_detect_seed, dict):
             ad.update({k: v for k, v in auto_detect_seed.items() if k in DEFAULT_AUTO_DETECT})
@@ -197,6 +304,7 @@ def _migrate_items(loaded):
             "label": label,
             "enabled": bool(enabled) if isinstance(enabled, bool) else True,
             "volume": float(volume) if isinstance(volume, (int, float)) else 1.0,
+            "mono": bool(mono) if isinstance(mono, bool) else False,
             "auto_detect": ad,
         }
 
@@ -208,7 +316,7 @@ def _migrate_items(loaded):
             elif isinstance(entry, dict) and isinstance(entry.get("label"), str):
                 result.append(fresh_entry(
                     entry["label"], entry.get("auto_detect"),
-                    entry.get("enabled", True), entry.get("volume", 1.0),
+                    entry.get("enabled", True), entry.get("volume", 1.0), entry.get("mono", False),
                 ))
         return result
 
@@ -230,12 +338,38 @@ def load_state():
     mic = data.get("mic", {}) if isinstance(data.get("mic"), dict) else {}
     state["mic"]["inputs"] = _migrate_items(mic.get("inputs"))
     state["mic"]["outputs"] = _migrate_items(mic.get("outputs"))
+    mic_ns = mic.get("noise_suppression")
+    state["mic"]["noise_suppression"] = mic_ns if mic_ns in ("none",) + NOISE_SUPPRESSION_METHODS else "none"
     speaker = data.get("speaker", {}) if isinstance(data.get("speaker"), dict) else {}
     state["speaker"]["inputs"] = _migrate_items(speaker.get("inputs"))
     state["speaker"]["outputs"] = _migrate_items(speaker.get("outputs"))
     state["speaker"]["bypass"] = _migrate_items(speaker.get("bypass"))
     if speaker.get("bypass_target"):
         state["speaker"]["bypass_target"] = speaker["bypass_target"]
+
+    custom = data.get("custom", {}) if isinstance(data.get("custom"), dict) else {}
+    raw_conduits = custom.get("conduits", []) if isinstance(custom.get("conduits"), list) else []
+    conduits = []
+    max_seen_id = 0
+    for entry in raw_conduits:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), int):
+            continue
+        max_seen_id = max(max_seen_id, entry["id"])
+        conduit_ns = entry.get("mic_noise_suppression")
+        conduits.append({
+            "id": entry["id"],
+            "name": entry.get("name") or f"Custom Conduit {entry['id']}",
+            "as_speaker": bool(entry.get("as_speaker", True)),
+            "as_microphone": bool(entry.get("as_microphone", False)),
+            "mic_noise_suppression": conduit_ns if conduit_ns in ("none",) + NOISE_SUPPRESSION_METHODS else "none",
+            "inputs": _migrate_items(entry.get("inputs")),
+            "outputs": _migrate_items(entry.get("outputs")),
+        })
+    next_id = custom.get("next_id")
+    if not isinstance(next_id, int) or next_id <= max_seen_id:
+        next_id = max_seen_id + 1
+    state["custom"] = {"next_id": next_id, "conduits": conduits}
+
     return state
 
 
@@ -477,6 +611,109 @@ def pair_ports(src_ports, dst_ports):
     return list(zip((p for p, _ in src_ports), (p for p, _ in dst_ports)))
 
 
+def pair_ports_for_entry(src_ports, dst_ports, mono):
+    """Like pair_ports(), but when `mono` is set, links EVERY source port
+    to EVERY destination port instead of matching by channel. This is
+    what makes a single-channel mic properly reach both FL and FR of a
+    stereo destination (plain pair_ports() would only fill one side and
+    leave the other silent), and symmetrically sums a stereo source down
+    into a single-channel destination."""
+    if mono:
+        return [(sp, dp) for sp, _ in src_ports for dp, _ in dst_ports]
+    return pair_ports(src_ports, dst_ports)
+
+
+_GAIN_NODE_PREFIX = "conduit_gain_"
+
+
+def gain_node_name(scope_key):
+    """Deterministic technical node name for a per-entry gain node, so the
+    same (list, label) pair maps to the same node across cycles/restarts
+    instead of leaking a new one every time."""
+    digest = hashlib.md5(scope_key.encode("utf-8")).hexdigest()[:12]
+    return f"{_GAIN_NODE_PREFIX}{digest}"
+
+
+def enumerate_gain_specs(state):
+    """Return {gain_node_name: volume} for every enabled entry, across
+    every list including custom conduits, whose volume != 1.0. Computed
+    directly from config (no live PipeWire data needed) so it can run
+    before compute_desired_links needs to know whether these nodes
+    exist yet -- same ordering as sync_custom_conduits."""
+    specs = {}
+
+    def add(scope, entries):
+        for entry in entries:
+            if not entry.get("enabled", True):
+                continue
+            volume = entry.get("volume", 1.0)
+            if volume == 1.0:
+                continue
+            specs[gain_node_name(f"{scope}:{entry['label']}")] = volume
+
+    add("mic.inputs", state["mic"]["inputs"])
+    add("mic.outputs", state["mic"]["outputs"])
+    add("speaker.inputs", state["speaker"]["inputs"])
+    add("speaker.outputs", state["speaker"]["outputs"])
+    add("speaker.bypass", state["speaker"]["bypass"])
+    for conduit in state.get("custom", {}).get("conduits", []):
+        add(f"custom.{conduit['id']}.inputs", conduit.get("inputs", []))
+        add(f"custom.{conduit['id']}.outputs", conduit.get("outputs", []))
+    return specs
+
+
+def sync_gain_nodes(gain_specs, nodes):
+    """Ensure a dedicated adapter node exists for every entry that needs
+    independent volume, continuously re-apply its volume (same "pin it"
+    behavior as everything else volume-related), and destroy any gain
+    node that's no longer needed -- volume back to 1.0, entry disabled,
+    or removed entirely."""
+    for name, volume in gain_specs.items():
+        node = find_virtual(nodes, name)
+        if node is None:
+            _create_dynamic_node(name, "Conduit Gain", "Audio/Sink")
+        else:
+            subprocess.run(
+                ["wpctl", "set-volume", str(node.id), f"{volume}", "-l", str(VOLUME_BOOST_LIMIT)],
+                capture_output=True,
+            )
+    for node in list(nodes.values()):
+        if node.name.startswith(_GAIN_NODE_PREFIX) and node.name not in gain_specs:
+            _destroy_dynamic_node(node.id, node.name)
+
+
+def collect_noise_requests(state):
+    """Return {consumer_key: method} for the Virtual Mic ("mic") and any
+    as_microphone Custom Conduit ("custom.<id>") currently requesting
+    noise suppression."""
+    requests = {}
+    mic_method = state["mic"].get("noise_suppression", "none")
+    if mic_method in NOISE_SUPPRESSION_METHODS:
+        requests["mic"] = mic_method
+    for conduit in state.get("custom", {}).get("conduits", []):
+        if not conduit.get("as_microphone"):
+            continue
+        method = conduit.get("mic_noise_suppression", "none")
+        if method in NOISE_SUPPRESSION_METHODS:
+            requests[f"custom.{conduit['id']}"] = method
+    return requests
+
+
+def allocate_noise_processors(requests):
+    """Assign each requester a pool slot for its method, sorted by
+    consumer key for determinism. Returns {consumer_key: (in_name, out_name)}."""
+    alloc = {}
+    for method in NOISE_SUPPRESSION_METHODS:
+        consumers = sorted(key for key, m in requests.items() if m == method)
+        for i, key in enumerate(consumers):
+            if i >= NOISE_SUPPRESSION_POOL_SIZE:
+                print(f"conduit-daemon: no free {method} noise-suppression slot for {key!r} "
+                      f"(pool size {NOISE_SUPPRESSION_POOL_SIZE} exceeded)", flush=True)
+                continue
+            alloc[key] = noise_processor_names(method, i + 1)
+    return alloc
+
+
 # ---------------------------------------------------------------------------
 # RECONCILIATION
 # ---------------------------------------------------------------------------
@@ -497,55 +734,132 @@ def pw_unlink(src_port, dst_port):
 
 def compute_desired_links(state, nodes):
     """Return {(src_port, dst_port)} for every link Conduit wants to exist,
-    and the set of "managed scopes" -- (node_id, node_id) pairs whose
-    existing links we're allowed to prune if they're no longer desired."""
+    the set of "managed scopes" -- (node_id, node_id) pairs whose existing
+    links we're allowed to prune if they're no longer desired -- and the
+    node that should act as the mic's effective output (Virtual Mic
+    itself, or its noise-suppression processor's output if one is
+    active) for enforce_defaults() to point the system default source at."""
     desired = set()
     managed_node_pairs = set()
+    gain_specs = enumerate_gain_specs(state)
+    noise_alloc = allocate_noise_processors(collect_noise_requests(state))
 
     virtual_speaker = find_virtual(nodes, VIRTUAL_SPEAKER)
     virtual_mic = find_virtual(nodes, VIRTUAL_MIC)
 
-    def route(src_node, dst_node):
+    def route(src_node, dst_node, gain_key=None, mono=False):
+        """src_node -> dst_node, or src_node -> gain_node -> dst_node if
+        gain_key names an entry whose volume != 1.0 (see enumerate_gain_specs).
+        `mono` only affects the segment touching src_node/dst_node directly
+        -- see pair_ports_for_entry."""
         if src_node is None or dst_node is None:
             return
-        for pair in pair_ports(src_node.output_ports, dst_node.input_ports):
+        gname = gain_node_name(gain_key) if gain_key else None
+        if gname and gname in gain_specs:
+            gain_node = find_virtual(nodes, gname)
+            if gain_node is None:
+                return  # sync_gain_nodes will create it; links follow next cycle
+            for pair in pair_ports_for_entry(src_node.output_ports, gain_node.input_ports, mono):
+                desired.add(pair)
+            managed_node_pairs.add((src_node.id, gain_node.id))
+            for pair in pair_ports(gain_node.output_ports, dst_node.input_ports):
+                desired.add(pair)
+            managed_node_pairs.add((gain_node.id, dst_node.id))
+            return
+        for pair in pair_ports_for_entry(src_node.output_ports, dst_node.input_ports, mono):
             desired.add(pair)
         managed_node_pairs.add((src_node.id, dst_node.id))
+
+    def route_from_hub(hub_node, dest_node, gain_key=None, mono=False):
+        """hub_node -> dest_node -- the mirror of route(), used where the
+        source side is always-known-to-exist (Virtual Speaker's monitor, a
+        custom conduit's base node) rather than something resolved from a
+        label. Same gain/mono handling, just applied to the destination
+        segment instead of the source segment."""
+        if dest_node is None or hub_node is None:
+            return
+        gname = gain_node_name(gain_key) if gain_key else None
+        if gname and gname in gain_specs:
+            gain_node = find_virtual(nodes, gname)
+            if gain_node is None:
+                return
+            for pair in pair_ports(hub_node.output_ports, gain_node.input_ports):
+                desired.add(pair)
+            managed_node_pairs.add((hub_node.id, gain_node.id))
+            for pair in pair_ports_for_entry(gain_node.output_ports, dest_node.input_ports, mono):
+                desired.add(pair)
+            managed_node_pairs.add((gain_node.id, dest_node.id))
+            return
+        for pair in pair_ports_for_entry(hub_node.output_ports, dest_node.input_ports, mono):
+            desired.add(pair)
+        managed_node_pairs.add((hub_node.id, dest_node.id))
+
+    def route_entries(scope, entries, nodes, predicate, sink_fn):
+        """Iterate one list's entries, expanding each one's own
+        auto-detect sweep individually (rather than unioning the whole
+        list at once) so gain/mono only ever apply to an entry's own
+        literal label, never to an auto-detected sibling it swept in --
+        same rule volume already followed before mono/gain existed."""
+        for entry in entries:
+            if not entry.get("enabled", True):
+                continue
+            swept = expand_item_auto_detect(entry["label"], entry.get("auto_detect", DEFAULT_AUTO_DETECT), nodes, predicate)
+            for label in swept:
+                is_own = label == entry["label"]
+                gain_key = f"{scope}:{label}" if is_own else None
+                mono = entry.get("mono", False) if is_own else False
+                sink_fn(label, gain_key, mono)
 
     # --- Mic side ---
     # conduit_virtual_mic is one node that's both linkable-into (its
     # input ports, same as a sink would have) and selectable as a
     # recording device (its output ports feed whatever selects it as
     # a source) -- see module.nix for why one node covers both roles.
+    mic_effective_source = virtual_mic
     if virtual_mic:
-        for label in expand_items(state["mic"]["inputs"], nodes, is_producer):
+        # If noise suppression is requested and its pool slot's processor
+        # nodes actually exist (nix option enabled + rebuilt), splice it
+        # in: Virtual Mic's own output feeds the processor's input, and
+        # the processor's output becomes what everything downstream --
+        # mic.outputs entries AND the system default source -- reads
+        # from instead of Virtual Mic directly.
+        mic_ns_names = noise_alloc.get("mic")
+        if mic_ns_names:
+            processor_in = find_virtual(nodes, mic_ns_names[0])
+            processor_out = find_virtual(nodes, mic_ns_names[1])
+            if processor_in:
+                for pair in pair_ports(virtual_mic.output_ports, processor_in.input_ports):
+                    desired.add(pair)
+                managed_node_pairs.add((virtual_mic.id, processor_in.id))
+            if processor_out:
+                mic_effective_source = processor_out
+
+        def mic_input(label, gain_key, mono):
             real_mic = find_node_verbose(nodes, label, is_producer, "mic input")
-            route(real_mic, virtual_mic)
-        for label in expand_items(state["mic"]["outputs"], nodes, is_consumer):
+            route(real_mic, virtual_mic, gain_key, mono)
+        route_entries("mic.inputs", state["mic"]["inputs"], nodes, is_producer, mic_input)
+
+        def mic_output(label, gain_key, mono):
             app = find_node_verbose(nodes, label, is_consumer, "mic output")
-            route(virtual_mic, app)
+            route(mic_effective_source, app, gain_key, mono)
+        route_entries("mic.outputs", state["mic"]["outputs"], nodes, is_consumer, mic_output)
 
     # --- Speaker side ---
     bypass_set = expand_items(state["speaker"]["bypass"], nodes, is_producer)
     if virtual_speaker:
-        for label in expand_items(state["speaker"]["inputs"], nodes, is_producer):
+        def speaker_input(label, gain_key, mono):
             if label in bypass_set:
-                continue  # bypass always wins over inputs
+                return  # bypass always wins over inputs
             app = find_node_verbose(nodes, label, is_producer, "speaker input")
-            route(app, virtual_speaker)
-        for label in expand_items(state["speaker"]["outputs"], nodes, is_consumer):
+            route(app, virtual_speaker, gain_key, mono)
+        route_entries("speaker.inputs", state["speaker"]["inputs"], nodes, is_producer, speaker_input)
+
+        def speaker_output(label, gain_key, mono):
             destination = find_node_verbose(nodes, label, is_consumer, "speaker output")
-            if destination is None or virtual_speaker is None:
-                continue
-            for pair in pair_ports(virtual_speaker.output_ports, destination.input_ports):
-                # virtual_speaker itself has no output ports (it's a sink) --
-                # what we actually want is its *monitor* ports, which pw-dump
-                # reports as this same node's output ports since a sink's
-                # monitor ports live on the sink node itself. The
-                # destination can be real hardware or an app that wants to
-                # consume the mix (e.g. a screen-share audio capture node).
-                desired.add(pair)
-            managed_node_pairs.add((virtual_speaker.id, destination.id))
+            # destination can be real hardware or an app that wants to
+            # consume the mix (e.g. a screen-share audio capture node).
+            route_from_hub(virtual_speaker, destination, gain_key, mono)
+        route_entries("speaker.outputs", state["speaker"]["outputs"], nodes, is_consumer, speaker_output)
 
     # --- Bypass: force-disconnect from virtual speaker, connect direct ---
     bypass_target_label = state["speaker"].get("bypass_target")
@@ -553,18 +867,115 @@ def compute_desired_links(state, nodes):
         find_node_verbose(nodes, bypass_target_label, is_hardware_sink, "bypass target")
         if bypass_target_label else None
     )
-    for label in bypass_set:
-        app = find_node_verbose(nodes, label, is_producer, "bypass app")
-        if app is None:
+    for entry in state["speaker"]["bypass"]:
+        if not entry.get("enabled", True):
             continue
-        # Always mark (app -> virtual_speaker) as managed so any existing
-        # link there gets pruned below, even with no bypass_target chosen yet.
-        if virtual_speaker:
-            managed_node_pairs.add((app.id, virtual_speaker.id))
-        if bypass_target:
-            route(app, bypass_target)
+        swept = expand_item_auto_detect(entry["label"], entry.get("auto_detect", DEFAULT_AUTO_DETECT), nodes, is_producer)
+        for label in swept:
+            app = find_node_verbose(nodes, label, is_producer, "bypass app")
+            if app is None:
+                continue
+            # Always mark (app -> virtual_speaker) as managed so any existing
+            # link there gets pruned below, even with no bypass_target chosen yet.
+            if virtual_speaker:
+                managed_node_pairs.add((app.id, virtual_speaker.id))
+            if bypass_target:
+                is_own = label == entry["label"]
+                gain_key = f"speaker.bypass:{label}" if is_own else None
+                mono = entry.get("mono", False) if is_own else False
+                route(app, bypass_target, gain_key, mono)
 
-    return desired, managed_node_pairs
+    # --- Custom conduits ---
+    # Each conduit's own Input/Output lists behave exactly like the
+    # Speaker panel's (same route()/route_from_hub() helpers); the only
+    # extra piece is the optional internal tap into its as_microphone
+    # sibling node, wired the same way Speaker Output routes to a
+    # destination -- the primary node's monitor ports feed the tap's
+    # input ports, so the tap always carries whatever the primary is
+    # currently carrying.
+    for conduit in state.get("custom", {}).get("conduits", []):
+        base = find_virtual(nodes, custom_node_name(conduit["id"]))
+        if base is None:
+            continue  # not created by sync_custom_conduits() yet -- next cycle will pick it up
+        cid = conduit["id"]
+        label_prefix = f"custom[{conduit.get('name', cid)}]"
+
+        def custom_input(label, gain_key, mono):
+            src = find_node_verbose(nodes, label, is_producer, f"{label_prefix} input")
+            route(src, base, gain_key, mono)
+        route_entries(f"custom.{cid}.inputs", conduit.get("inputs", []), nodes, is_producer, custom_input)
+
+        def custom_output(label, gain_key, mono):
+            destination = find_node_verbose(nodes, label, is_consumer, f"{label_prefix} output")
+            route_from_hub(base, destination, gain_key, mono)
+        route_entries(f"custom.{cid}.outputs", conduit.get("outputs", []), nodes, is_consumer, custom_output)
+
+        if conduit.get("as_microphone"):
+            mic_tap = find_virtual(nodes, custom_mic_node_name(cid))
+            if mic_tap:
+                tap_source = base
+                ns_names = noise_alloc.get(f"custom.{cid}")
+                if ns_names:
+                    processor_in = find_virtual(nodes, ns_names[0])
+                    processor_out = find_virtual(nodes, ns_names[1])
+                    if processor_in:
+                        for pair in pair_ports(base.output_ports, processor_in.input_ports):
+                            desired.add(pair)
+                        managed_node_pairs.add((base.id, processor_in.id))
+                    if processor_out:
+                        tap_source = processor_out
+                for pair in pair_ports(tap_source.output_ports, mic_tap.input_ports):
+                    desired.add(pair)
+                managed_node_pairs.add((tap_source.id, mic_tap.id))
+
+    return desired, managed_node_pairs, mic_effective_source
+
+
+def sync_custom_conduits(state, nodes):
+    """Ensure every configured custom conduit's underlying PipeWire
+    node(s) exist, and destroy any leftover ones that are no longer
+    configured (a whole conduit deleted, or as_microphone turned back
+    off). Nodes created here won't be visible until the NEXT cycle's
+    fresh pw-dump -- fine, since this loop runs continuously anyway."""
+    configured = state.get("custom", {}).get("conduits", [])
+    expected_names = set()
+    for conduit in configured:
+        base_name = custom_node_name(conduit["id"])
+        expected_names.add(base_name)
+        if find_virtual(nodes, base_name) is None:
+            _create_dynamic_node(base_name, conduit.get("name", base_name), "Audio/Sink")
+        if conduit.get("as_microphone"):
+            mic_name = custom_mic_node_name(conduit["id"])
+            expected_names.add(mic_name)
+            if find_virtual(nodes, mic_name) is None:
+                _create_dynamic_node(mic_name, f"{conduit.get('name', mic_name)} (Mic)", "Audio/Source/Virtual")
+
+    for node in list(nodes.values()):
+        if node.name.startswith(_CUSTOM_NODE_PREFIX) and node.name not in expected_names:
+            _destroy_dynamic_node(node.id, node.name)
+
+
+def _create_dynamic_node(node_name, description, media_class):
+    description = description.replace('"', "'")
+    args = (
+        "{ factory.name=support.null-audio-sink "
+        f'node.name="{node_name}" node.description="{description}" '
+        f"media.class={media_class} object.linger=true "
+        "audio.position=[FL,FR] monitor.channel-volumes=true }"
+    )
+    result = subprocess.run(["pw-cli", "create-node", "adapter", args], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"conduit-daemon: failed to create {node_name!r}: {result.stderr.strip()}", flush=True)
+    else:
+        print(f"conduit-daemon: created dynamic node {node_name!r} ({media_class})", flush=True)
+
+
+def _destroy_dynamic_node(node_id, node_name):
+    result = subprocess.run(["pw-cli", "destroy", str(node_id)], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"conduit-daemon: failed to destroy {node_name!r} (id={node_id}): {result.stderr.strip()}", flush=True)
+    else:
+        print(f"conduit-daemon: destroyed dynamic node {node_name!r} (id={node_id})", flush=True)
 
 
 def _load_link_cache():
@@ -583,7 +994,9 @@ def _save_link_cache(pairs):
 
 
 def reconcile(state, nodes, dump):
-    desired, managed_pairs = compute_desired_links(state, nodes)
+    """Returns the mic_effective_source node from compute_desired_links,
+    passed through so main() can feed it to enforce_defaults()."""
+    desired, managed_pairs, mic_effective_source = compute_desired_links(state, nodes)
     existing = current_links(dump)
 
     # Build a lookup from port id -> owning node id, so we can tell whether
@@ -620,43 +1033,16 @@ def reconcile(state, nodes, dump):
             pw_link(out_port, in_port)
 
     _save_link_cache(managed_pairs)
+    return mic_effective_source
 
 
-def enforce_defaults(nodes):
+def enforce_defaults(nodes, mic_default_node=None):
     virtual_speaker = find_virtual(nodes, VIRTUAL_SPEAKER)
-    virtual_mic = find_virtual(nodes, VIRTUAL_MIC)
     if virtual_speaker:
         subprocess.run(["wpctl", "set-default", str(virtual_speaker.id)], capture_output=True)
-    if virtual_mic:
-        subprocess.run(["wpctl", "set-default", str(virtual_mic.id)], capture_output=True)
-
-
-def enforce_volumes(state, nodes):
-    """Continuously pin each enabled entry's volume multiplier (see the
-    ENABLED / VOLUME section in the module docstring). Applies only to
-    the device an entry's own label matches -- not to any auto-detected
-    siblings -- and only when volume != 1.0, since 1.0 means "not
-    managing this device's volume" rather than "force it to 100%"."""
-    all_entries = (
-        [(e, is_producer) for e in state["mic"]["inputs"]] +
-        [(e, is_consumer) for e in state["mic"]["outputs"]] +
-        [(e, is_producer) for e in state["speaker"]["inputs"]] +
-        [(e, is_consumer) for e in state["speaker"]["outputs"]] +
-        [(e, is_producer) for e in state["speaker"]["bypass"]]
-    )
-    for entry, predicate in all_entries:
-        if not entry.get("enabled", True):
-            continue
-        volume = entry.get("volume", 1.0)
-        if volume == 1.0:
-            continue
-        node = find_node(nodes, entry["label"], predicate)
-        if node is None:
-            continue
-        subprocess.run(
-            ["wpctl", "set-volume", str(node.id), f"{volume}", "-l", str(VOLUME_BOOST_LIMIT)],
-            capture_output=True,
-        )
+    target = mic_default_node or find_virtual(nodes, VIRTUAL_MIC)
+    if target:
+        subprocess.run(["wpctl", "set-default", str(target.id)], capture_output=True)
 
 
 # ---------------------------------------------------------------------------
@@ -689,9 +1075,10 @@ def main():
                               f"client_id={node.client_id})", flush=True)
                     printed_inventory = True
 
-                enforce_defaults(nodes)
-                enforce_volumes(state, nodes)
-                reconcile(state, nodes, dump)
+                sync_custom_conduits(state, nodes)
+                sync_gain_nodes(enumerate_gain_specs(state), nodes)
+                mic_effective_source = reconcile(state, nodes, dump)
+                enforce_defaults(nodes, mic_effective_source)
         except Exception:
             # Belt-and-suspenders: a silently-dying loop is much harder to
             # debug than a noisy one. Print the full traceback and keep

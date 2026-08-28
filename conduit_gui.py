@@ -35,7 +35,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QListWidget, QListWidgetItem, QPushButton, QFrame,
-    QCheckBox, QLineEdit, QDoubleSpinBox, QSystemTrayIcon, QMenu,
+    QCheckBox, QLineEdit, QDoubleSpinBox, QSystemTrayIcon, QMenu, QScrollArea,
 )
 
 PLACEHOLDER = "Add a device or app…"
@@ -48,12 +48,12 @@ RESTART_DEBOUNCE_MS = 600
 # (apps come and go, so this can't be cached for long).
 # ---------------------------------------------------------------------------
 
-def eligible_labels(nodes, predicate):
+def eligible_labels(nodes, predicate, exclude_labels=()):
     labels = []
     for node in nodes.values():
         if predicate(node):
             label = node.display_label
-            if label and label not in labels:
+            if label and label not in labels and label not in exclude_labels:
                 labels.append(label)
     return sorted(labels)
 
@@ -159,6 +159,51 @@ def _auto_detect_is_active(config):
 
 
 # ---------------------------------------------------------------------------
+# Noise Suppression: a small popup for the Virtual Mic and any
+# as_microphone Custom Conduit. Unlike Auto-Detect's independently
+# combinable strategies, this is a single mutually-exclusive choice, so
+# a plain dropdown rather than checkboxes. See conduit_daemon's NOISE
+# SUPPRESSION docstring section for what actually happens at the
+# PipeWire level, and note the pool is only present at all once
+# services.conduit.noiseSuppression.enable is set and rebuilt.
+# ---------------------------------------------------------------------------
+
+NOISE_SUPPRESSION_LABELS = [
+    ("none", "None"),
+    ("rnnoise", "RNNoise (better quality)"),
+    ("webrtc", "WebRTC (built-in, lower quality)"),
+]
+
+
+class NoiseSuppressionPopup(QWidget):
+    def __init__(self, current_method, on_apply, anchor_widget):
+        super().__init__(anchor_widget, Qt.Popup)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(QLabel("<b>Noise Suppression</b>"))
+
+        note = QLabel("Only available if services.conduit.noiseSuppression.enable "
+                       "is set in your NixOS config (and rebuilt).")
+        note.setWordWrap(True)
+        note.setMaximumWidth(240)
+        layout.addWidget(note)
+
+        self.combo = QComboBox()
+        for key, label in NOISE_SUPPRESSION_LABELS:
+            self.combo.addItem(label, key)
+        idx = self.combo.findData(current_method)
+        self.combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo.currentIndexChanged.connect(lambda _: on_apply(self.combo.currentData()))
+        layout.addWidget(self.combo)
+
+        self.adjustSize()
+
+
+def _noise_suppression_button_text(method):
+    return "Noise Suppression" + ("" if method == "none" else " \u2713")
+
+
+# ---------------------------------------------------------------------------
 # A labeled "dropdown adds to a removable list" widget. Each row carries
 # its own auto-detect config (via the "^" button), since a list often
 # mixes real hardware with an app-created virtual device and a single
@@ -206,7 +251,7 @@ class AddListSection(QWidget):
         self._add_row(label)
         self._on_change()
 
-    def _add_row(self, label, enabled=True, volume=1.0, auto_detect=None):
+    def _add_row(self, label, enabled=True, volume=1.0, mono=False, auto_detect=None):
         auto_detect = {**DEFAULT_AUTO_DETECT, **(auto_detect or {})}
         item = QListWidgetItem(self.list_widget)
         item.setData(Qt.UserRole, auto_detect)
@@ -224,13 +269,23 @@ class AddListSection(QWidget):
         row_layout.addWidget(QLabel(label))
         row_layout.addStretch()
 
+        mono_cb = QCheckBox("Mono")
+        mono_cb.setToolTip("Treat this device as mono -- fans a single channel out to both stereo "
+                            "channels on the other side (or sums a stereo signal down to it), instead "
+                            "of the normal one-to-one channel matching that can otherwise leave one "
+                            "side silent")
+        mono_cb.setChecked(mono)
+        mono_cb.toggled.connect(self._on_change)
+        row_layout.addWidget(mono_cb)
+
         volume_spin = QDoubleSpinBox()
         volume_spin.setRange(0.0, 10.0)
         volume_spin.setSingleStep(0.1)
         volume_spin.setDecimals(2)
         volume_spin.setSuffix("x")
         volume_spin.setFixedWidth(70)
-        volume_spin.setToolTip("Volume multiplier -- 1.00x leaves it alone, 2.00x doubles it, continuously enforced")
+        volume_spin.setToolTip("Volume multiplier -- 1.00x leaves it alone, 2.00x doubles it, continuously "
+                                "enforced, and independent per row even if the same device appears elsewhere")
         volume_spin.setValue(volume)
         volume_spin.valueChanged.connect(self._on_change)
         row_layout.addWidget(volume_spin)
@@ -253,6 +308,7 @@ class AddListSection(QWidget):
         # these live as attributes on the row widget rather than parsed
         # back out of child layout positions.
         row._conduit_enabled_cb = enabled_cb
+        row._conduit_mono_cb = mono_cb
         row._conduit_volume_spin = volume_spin
         row._conduit_label = label
 
@@ -285,7 +341,7 @@ class AddListSection(QWidget):
         return [entry["label"] for entry in self.items()]
 
     def items(self):
-        """Return [{"label", "enabled", "volume", "auto_detect"}, ...] in display order."""
+        """Return [{"label", "enabled", "volume", "mono", "auto_detect"}, ...] in display order."""
         result = []
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
@@ -295,6 +351,7 @@ class AddListSection(QWidget):
                 "label": widget._conduit_label,
                 "enabled": widget._conduit_enabled_cb.isChecked(),
                 "volume": widget._conduit_volume_spin.value(),
+                "mono": widget._conduit_mono_cb.isChecked(),
                 "auto_detect": auto_detect,
             })
         return result
@@ -309,6 +366,7 @@ class AddListSection(QWidget):
                     entry["label"],
                     entry.get("enabled", True),
                     entry.get("volume", 1.0),
+                    entry.get("mono", False),
                     entry.get("auto_detect"),
                 )
 
@@ -370,6 +428,116 @@ class SingleSelectSection(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# One user-created "Custom Conduit" -- name (click to edit), As
+# Speaker / As Microphone checkboxes, and its own Input/Output lists.
+# See conduit_daemon's CUSTOM CONDUITS docstring section for what the
+# checkboxes actually do at the PipeWire level.
+# ---------------------------------------------------------------------------
+
+class CustomConduitBox(QFrame):
+    def __init__(self, conduit_id, on_change, on_remove, parent=None):
+        super().__init__(parent)
+        self.conduit_id = conduit_id
+        self._on_change = on_change
+        self.setFrameShape(QFrame.StyledPanel)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        header = QHBoxLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setFrame(False)
+        self.name_edit.setStyleSheet("background: transparent; font-weight: bold; font-size: 13pt;")
+        self.name_edit.setToolTip("Click to rename")
+        self.name_edit.editingFinished.connect(self._on_change)
+        header.addWidget(self.name_edit, 1)
+
+        self.as_speaker_cb = QCheckBox("As Speaker")
+        self.as_speaker_cb.setToolTip("Selectable as a playback device in apps. This is largely automatic for "
+                                       "any patch point like this one -- there's no reliable way to hide it "
+                                       "from speaker pickers even when unticked.")
+        self.as_speaker_cb.toggled.connect(self._on_change)
+        header.addWidget(self.as_speaker_cb)
+
+        self.as_mic_cb = QCheckBox("As Microphone")
+        self.as_mic_cb.setToolTip("Creates a second linked device so this conduit's mix is also selectable "
+                                   "as a recording device, like a \"Stereo Mix\"")
+        self.as_mic_cb.toggled.connect(self._on_as_mic_toggled)
+        header.addWidget(self.as_mic_cb)
+
+        self._mic_noise_suppression = "none"
+        self.ns_btn = QPushButton(_noise_suppression_button_text("none"))
+        self.ns_btn.setFlat(True)
+        self.ns_btn.setEnabled(False)
+        self.ns_btn.setToolTip("Only applies with \"As Microphone\" ticked")
+        self.ns_btn.clicked.connect(self._open_noise_suppression_popup)
+        header.addWidget(self.ns_btn)
+
+        remove_btn = QPushButton("\u2715 Remove")
+        remove_btn.setFlat(True)
+        remove_btn.clicked.connect(lambda: on_remove(self.conduit_id))
+        header.addWidget(remove_btn)
+
+        outer.addLayout(header)
+
+        lists = QHBoxLayout()
+        self.inputs = AddListSection("Input", self._on_change)
+        self.outputs = AddListSection("Output", self._on_change)
+        lists.addWidget(self.inputs)
+        lists.addWidget(self.outputs)
+        outer.addLayout(lists)
+
+    def _on_as_mic_toggled(self, checked):
+        self.ns_btn.setEnabled(checked)
+        self._on_change()
+
+    def _open_noise_suppression_popup(self):
+        def apply(method):
+            self._mic_noise_suppression = method
+            self.ns_btn.setText(_noise_suppression_button_text(method))
+            self._on_change()
+        popup = NoiseSuppressionPopup(self._mic_noise_suppression, apply, self.ns_btn)
+        popup.move(self.ns_btn.mapToGlobal(QPoint(0, -popup.sizeHint().height())))
+        popup.show()
+
+    def set_config(self, conduit):
+        self.name_edit.setText(conduit.get("name") or f"Custom Conduit {self.conduit_id}")
+        self.as_speaker_cb.setChecked(conduit.get("as_speaker", True))
+        self.as_mic_cb.setChecked(conduit.get("as_microphone", False))
+        self.ns_btn.setEnabled(self.as_mic_cb.isChecked())
+        self._mic_noise_suppression = conduit.get("mic_noise_suppression", "none")
+        self.ns_btn.setText(_noise_suppression_button_text(self._mic_noise_suppression))
+        self.inputs.set_items(conduit.get("inputs", []))
+        self.outputs.set_items(conduit.get("outputs", []))
+
+    def to_config(self):
+        name = self.name_edit.text().strip() or f"Custom Conduit {self.conduit_id}"
+        return {
+            "id": self.conduit_id,
+            "name": name,
+            "as_speaker": self.as_speaker_cb.isChecked(),
+            "as_microphone": self.as_mic_cb.isChecked(),
+            "mic_noise_suppression": self._mic_noise_suppression,
+            "inputs": self.inputs.items(),
+            "outputs": self.outputs.items(),
+        }
+
+    def own_node_labels(self):
+        """This conduit's own underlying device name(s) -- excluded from
+        its own Input/Output dropdowns so it can't be routed into itself."""
+        name = self.name_edit.text().strip() or f"Custom Conduit {self.conduit_id}"
+        labels = {name}
+        if self.as_mic_cb.isChecked():
+            labels.add(f"{name} (Mic)")
+        return labels
+
+    def refresh_devices(self, nodes):
+        exclude = self.own_node_labels()
+        self.inputs.set_eligible(eligible_labels(nodes, cd.is_producer, exclude))
+        self.outputs.set_eligible(eligible_labels(nodes, cd.is_consumer, exclude))
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -378,7 +546,7 @@ class ConduitWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Conduit")
         self.setWindowIcon(QIcon.fromTheme("conduit"))
-        self.resize(760, 480)
+        self.resize(900, 760)
 
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
@@ -394,10 +562,19 @@ class ConduitWindow(QMainWindow):
         refresh_btn = QPushButton("Refresh devices")
         refresh_btn.clicked.connect(self.refresh_devices)
         toolbar.addWidget(refresh_btn)
+        self.auto_refresh_cb = QCheckBox("Auto Refresh Devices")
+        self.auto_refresh_cb.setToolTip("Periodically re-check for new/gone devices on its own, "
+                                         "every few seconds, instead of only on manual Refresh")
+        self.auto_refresh_cb.toggled.connect(self._on_auto_refresh_toggled)
+        toolbar.addWidget(self.auto_refresh_cb)
         tray_btn = QPushButton("Close to Tray")
         tray_btn.clicked.connect(self.close_to_tray)
         toolbar.addWidget(tray_btn)
         outer.addLayout(toolbar)
+
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(3000)
+        self._auto_refresh_timer.timeout.connect(self.refresh_devices)
 
         self._tray_icon = None  # created lazily on first use of close_to_tray
 
@@ -423,6 +600,14 @@ class ConduitWindow(QMainWindow):
         # --- Mic panel (right) ---
         mic_box = QGroupBox("Microphone")
         mic_layout = QVBoxLayout(mic_box)
+        mic_header = QHBoxLayout()
+        mic_header.addStretch()
+        self.mic_ns_btn = QPushButton(_noise_suppression_button_text("none"))
+        self.mic_ns_btn.setFlat(True)
+        self.mic_ns_btn.clicked.connect(self._open_mic_noise_suppression_popup)
+        mic_header.addWidget(self.mic_ns_btn)
+        mic_layout.addLayout(mic_header)
+        self._mic_noise_suppression = "none"
         self.mic_inputs = AddListSection("Input", self._save)
         self.mic_outputs = AddListSection("Output", self._save)
         mic_layout.addWidget(self.mic_inputs)
@@ -430,6 +615,36 @@ class ConduitWindow(QMainWindow):
         mic_layout.addWidget(self.mic_outputs)
         mic_layout.addStretch()
         panels.addWidget(mic_box)
+
+        # --- Custom Connection (below Speaker/Mic) ---
+        custom_box = QGroupBox("Custom Connection")
+        custom_outer = QVBoxLayout(custom_box)
+        custom_header = QHBoxLayout()
+        custom_header.addWidget(QLabel("Custom conduits are your own virtual patch points -- "
+                                        "route anything into them, then out to anything else."))
+        custom_header.addStretch()
+        add_custom_btn = QPushButton("+")
+        add_custom_btn.setFixedWidth(28)
+        add_custom_btn.setToolTip("Add a Custom Conduit")
+        add_custom_btn.clicked.connect(self._add_custom_conduit)
+        custom_header.addWidget(add_custom_btn)
+        custom_outer.addLayout(custom_header)
+
+        self._custom_container = QWidget()
+        self._custom_container_layout = QVBoxLayout(self._custom_container)
+        self._custom_container_layout.setContentsMargins(0, 0, 0, 0)
+        self._custom_container_layout.addStretch()
+
+        custom_scroll = QScrollArea()
+        custom_scroll.setWidgetResizable(True)
+        custom_scroll.setWidget(self._custom_container)
+        custom_scroll.setMinimumHeight(180)
+        custom_outer.addWidget(custom_scroll)
+
+        outer.addWidget(custom_box)
+
+        self.custom_conduit_boxes = {}  # id -> CustomConduitBox
+        self._next_custom_id = 1
 
         self._loading = True
         # refresh_devices() must run BEFORE load_state(): the Speakers
@@ -470,7 +685,45 @@ class ConduitWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    # -- noise suppression --------------------------------------------------
+
+    def _open_mic_noise_suppression_popup(self):
+        def apply(method):
+            self._mic_noise_suppression = method
+            self.mic_ns_btn.setText(_noise_suppression_button_text(method))
+            self._save()
+        popup = NoiseSuppressionPopup(self._mic_noise_suppression, apply, self.mic_ns_btn)
+        popup.move(self.mic_ns_btn.mapToGlobal(QPoint(0, -popup.sizeHint().height())))
+        popup.show()
+
+    # -- custom conduits ---------------------------------------------------
+
+    def _add_custom_conduit(self):
+        conduit_id = self._next_custom_id
+        self._next_custom_id += 1
+        box = CustomConduitBox(conduit_id, self._save, self._remove_custom_conduit)
+        box.set_config({"id": conduit_id, "name": f"Custom Conduit {conduit_id}",
+                         "as_speaker": True, "as_microphone": False, "inputs": [], "outputs": []})
+        self.custom_conduit_boxes[conduit_id] = box
+        # Insert before the trailing stretch so new boxes stack top-down.
+        self._custom_container_layout.insertWidget(self._custom_container_layout.count() - 1, box)
+        box.refresh_devices(current_nodes())
+        self._save()
+
+    def _remove_custom_conduit(self, conduit_id):
+        box = self.custom_conduit_boxes.pop(conduit_id, None)
+        if box is not None:
+            self._custom_container_layout.removeWidget(box)
+            box.deleteLater()
+            self._save()
+
     # -- device list refresh --------------------------------------------
+
+    def _on_auto_refresh_toggled(self, checked):
+        if checked:
+            self._auto_refresh_timer.start()
+        else:
+            self._auto_refresh_timer.stop()
 
     def refresh_devices(self):
         nodes = current_nodes()
@@ -480,6 +733,8 @@ class ConduitWindow(QMainWindow):
         self.speaker_outputs.set_eligible(eligible_labels(nodes, cd.is_consumer))
         self.speaker_bypass.set_eligible(eligible_labels(nodes, cd.is_producer))
         self.speakers_target.set_eligible(eligible_labels(nodes, cd.is_hardware_sink))
+        for box in self.custom_conduit_boxes.values():
+            box.refresh_devices(nodes)
 
     # -- persistence ------------------------------------------------------
 
@@ -488,22 +743,43 @@ class ConduitWindow(QMainWindow):
         state = cd.load_state()
         self.mic_inputs.set_items(state["mic"]["inputs"])
         self.mic_outputs.set_items(state["mic"]["outputs"])
+        self._mic_noise_suppression = state["mic"].get("noise_suppression", "none")
+        self.mic_ns_btn.setText(_noise_suppression_button_text(self._mic_noise_suppression))
         self.speaker_inputs.set_items(state["speaker"]["inputs"])
         self.speaker_outputs.set_items(state["speaker"]["outputs"])
         self.speaker_bypass.set_items(state["speaker"]["bypass"])
         self.speakers_target.set_value(state["speaker"].get("bypass_target"))
+
+        custom = state.get("custom", {"next_id": 1, "conduits": []})
+        self._next_custom_id = custom.get("next_id", 1)
+        for conduit_id, box in list(self.custom_conduit_boxes.items()):
+            self._custom_container_layout.removeWidget(box)
+            box.deleteLater()
+        self.custom_conduit_boxes = {}
+        nodes = current_nodes()
+        for conduit in custom.get("conduits", []):
+            box = CustomConduitBox(conduit["id"], self._save, self._remove_custom_conduit)
+            box.set_config(conduit)
+            box.refresh_devices(nodes)
+            self.custom_conduit_boxes[conduit["id"]] = box
+            self._custom_container_layout.insertWidget(self._custom_container_layout.count() - 1, box)
 
     def _current_state(self):
         return {
             "mic": {
                 "inputs": self.mic_inputs.items(),
                 "outputs": self.mic_outputs.items(),
+                "noise_suppression": self._mic_noise_suppression,
             },
             "speaker": {
                 "inputs": self.speaker_inputs.items(),
                 "outputs": self.speaker_outputs.items(),
                 "bypass": self.speaker_bypass.items(),
                 "bypass_target": self.speakers_target.value(),
+            },
+            "custom": {
+                "next_id": self._next_custom_id,
+                "conduits": [box.to_config() for box in self.custom_conduit_boxes.values()],
             },
         }
 
