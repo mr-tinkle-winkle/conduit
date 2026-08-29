@@ -239,10 +239,24 @@ rebuilds needed.
   above is enabled). The better-quality option.
 - **WebRTC** — PipeWire's built-in noise suppression, no extra package
   needed, but per real-world reports noticeably weaker than RNNoise.
-  Included as a no-extra-dependency fallback.
+  Included as a no-extra-dependency fallback -- costs more nodes than
+  RNNoise per slot (4 vs 2, since the underlying echo-cancel module
+  needs an echo-reference sink/playback pair even though nothing
+  actually feeds it in this standalone use), which is what shows up as
+  "Echo Cancel" entries in qpwgraph.
+
+Both are enabled by default, but if you only want one:
+
+```nix
+services.conduit.noiseSuppression.methods = [ "rnnoise" ];
+```
+
+drops the other pool entirely rather than leaving it provisioned and
+unused — worth doing if you've settled on RNNoise and don't need the
+fallback, since it removes real always-present nodes from your graph.
 
 Under the hood, this reserves a small fixed pool of processors (4 of
-each method by default — `services.conduit.noiseSuppression.poolSize`
+each *enabled* method by default — `services.conduit.noiseSuppression.poolSize`
 to change it) rather than one per user, since the number of Custom
 Conduits is unbounded but the statically-declared processors aren't.
 Realistically this only matters if you have more than 4 things

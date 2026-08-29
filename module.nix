@@ -90,11 +90,12 @@ let
   # Virtual Mic plus a few Custom Conduits); raise noiseSuppressionPoolSize
   # if you genuinely need more.
   noiseSuppressionPoolSize = cfg.noiseSuppression.poolSize;
+  noiseSuppressionMethods = cfg.noiseSuppression.methods;
 
   # RNNoise (via the LADSPA plugin in nixpkgs' rnnoise-plugin package) --
   # the higher-quality of the two options, a dedicated neural-network
   # denoiser with no other side effects.
-  rnnoiseProcessors = lib.genList (i:
+  rnnoiseProcessors = lib.optionals (lib.elem "rnnoise" noiseSuppressionMethods) (lib.genList (i:
     let n = toString (i + 1); in {
       name = "libpipewire-module-filter-chain";
       args = {
@@ -120,16 +121,21 @@ let
         };
       };
     }
-  ) noiseSuppressionPoolSize;
+  ) noiseSuppressionPoolSize);
 
   # WebRTC's built-in noise suppression, riding on PipeWire's own
   # echo-cancel module rather than a separate plugin -- no extra package
   # needed, but per real-world reports it's noticeably weaker than
-  # RNNoise (see README). Used here in "standalone" mode: the
-  # sink/playback side that would normally carry the echo-reference
-  # signal is left completely unconnected, so nothing is actually
-  # echo-cancelled -- only the webrtc.noise_suppression effect applies.
-  webrtcProcessors = lib.genList (i:
+  # RNNoise (see README), and each pool slot costs FOUR nodes (capture,
+  # source, plus an unused sink/playback pair the module requires even
+  # though nothing feeds them) versus RNNoise's two, which adds up fast
+  # in qpwgraph. Skip "webrtc" in noiseSuppression.methods if you don't
+  # specifically need the no-extra-package property. Used here in
+  # "standalone" mode: the sink/playback side that would normally carry
+  # the echo-reference signal is left completely unconnected, so nothing
+  # is actually echo-cancelled -- only the webrtc.noise_suppression
+  # effect applies.
+  webrtcProcessors = lib.optionals (lib.elem "webrtc" noiseSuppressionMethods) (lib.genList (i:
     let n = toString (i + 1); in {
       name = "libpipewire-module-echo-cancel";
       args = {
@@ -141,7 +147,7 @@ let
         "playback.props" = { "node.name" = "conduit_ns_webrtc_${n}_playback_unused"; "node.passive" = true; };
       };
     }
-  ) noiseSuppressionPoolSize;
+  ) noiseSuppressionPoolSize);
 
 in
 {
@@ -165,11 +171,26 @@ in
         WebRTC-noise-suppression processors
       '';
 
+      methods = lib.mkOption {
+        type = lib.types.listOf (lib.types.enum [ "rnnoise" "webrtc" ]);
+        default = [ "rnnoise" "webrtc" ];
+        example = [ "rnnoise" ];
+        description = ''
+          Which pool(s) to actually provision. Each entry costs real,
+          always-present PipeWire nodes (2 per RNNoise slot, 4 per WebRTC
+          slot -- the WebRTC module requires an echo-reference sink/
+          playback pair even in standalone use, hence "Echo Cancel"
+          entries showing up in qpwgraph). If RNNoise alone covers what
+          you need, dropping "webrtc" here removes that pool entirely
+          rather than leaving it provisioned and unused.
+        '';
+      };
+
       poolSize = lib.mkOption {
         type = lib.types.ints.positive;
         default = 4;
         description = ''
-          How many simultaneous users of EACH method (RNNoise, WebRTC)
+          How many simultaneous users of EACH method in noiseSuppression.methods
           to provision for. Only the Virtual Mic and Custom Conduits with
           "As Microphone" ticked can request noise suppression, so this
           rarely needs to be more than a handful.

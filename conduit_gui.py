@@ -47,9 +47,25 @@ class NoScrollComboBox(QComboBox):
     """A QComboBox that ignores mouse-wheel events instead of changing its
     selection -- the default Qt behavior changes the selected item on
     scroll even when the dropdown isn't open, which is surprising and
-    easy to trigger by accident while scrolling past one in a list."""
+    easy to trigger by accident while scrolling past one in a list.
+
+    Also keeps its own width from growing to fit whatever the longest
+    item happens to be (Qt's default AdjustToContentsOnFirstShow policy
+    would otherwise force it wider than its container, breaking equal
+    panel widths) -- long device names elide with "..." when the box is
+    too narrow to show them in full, and the popup list (opened on
+    click) always shows every item's complete text regardless."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(1)
+        self.currentIndexChanged.connect(self._update_tooltip)
+
     def wheelEvent(self, event):
         event.ignore()
+
+    def _update_tooltip(self, _index):
+        self.setToolTip(self.currentText())
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +236,7 @@ def _noise_suppression_button_text(method):
 # ---------------------------------------------------------------------------
 
 class AddListSection(QWidget):
-    def __init__(self, title, on_change, parent=None):
+    def __init__(self, title, on_change, parent=None, extra_header_widget=None):
         super().__init__(parent)
         self._on_change = on_change
         self._eligible = []
@@ -234,6 +250,12 @@ class AddListSection(QWidget):
         self.combo.addItem(PLACEHOLDER)
         self.combo.activated.connect(self._on_combo_activated)
         header.addWidget(self.combo, 1)
+        # Optional compact widget appended to the same header row -- used
+        # for Bypass's Destination picker, so it stays visually attached
+        # to Bypass (the two only make sense together) without eating a
+        # whole separate row's width the way a side-by-side layout would.
+        if extra_header_widget is not None:
+            header.addWidget(extra_header_widget)
         layout.addLayout(header)
 
         self.list_widget = QListWidget()
@@ -599,18 +621,17 @@ class ConduitWindow(QMainWindow):
         speaker_layout = QVBoxLayout(speaker_box)
         self.speaker_inputs = AddListSection("Input", self._save)
         self.speaker_outputs = AddListSection("Output", self._save)
-        self.speaker_bypass = AddListSection("Bypass", self._save)
         self.speakers_target = SingleSelectSection("Destination", DESTINATION_PLACEHOLDER, self._save)
+        self.speakers_target.setMaximumWidth(190)
+        self.speakers_target.combo.setMaximumWidth(130)
+        self.speaker_bypass = AddListSection("Bypass", self._save, extra_header_widget=self.speakers_target)
         speaker_layout.addWidget(self.speaker_inputs)
         speaker_layout.addWidget(_hline())
         speaker_layout.addWidget(self.speaker_outputs)
         speaker_layout.addWidget(_hline())
-        bypass_row = QHBoxLayout()
-        bypass_row.addWidget(self.speaker_bypass)
-        bypass_row.addWidget(self.speakers_target)
-        speaker_layout.addLayout(bypass_row)
+        speaker_layout.addWidget(self.speaker_bypass)
         speaker_layout.addStretch()
-        panels.addWidget(speaker_box)
+        panels.addWidget(speaker_box, 1)
 
         # --- Mic panel (right) ---
         mic_box = QGroupBox("Microphone")
@@ -629,7 +650,7 @@ class ConduitWindow(QMainWindow):
         mic_layout.addWidget(_hline())
         mic_layout.addWidget(self.mic_outputs)
         mic_layout.addStretch()
-        panels.addWidget(mic_box)
+        panels.addWidget(mic_box, 1)
 
         # --- Custom Connection (below Speaker/Mic) ---
         custom_box = QGroupBox("Custom Connection")
