@@ -218,12 +218,8 @@ part of that, the same brief interruption any other config change
 already causes.
 ## Noise Suppression
 
-Unlike everything else in this app, Noise Suppression needs a one-time
-opt-in in your NixOS config before it's usable at all — the actual DSP
-(RNNoise, WebRTC) is too complex to trust loading live at runtime the
-way Custom Conduits' plain patch-point nodes do, so it's declared
-statically instead, the same safe pattern as the two main virtual
-devices:
+Needs a one-time opt-in in your NixOS config before it's usable at
+all:
 
 ```nix
 services.conduit.noiseSuppression.enable = true;
@@ -231,37 +227,31 @@ services.conduit.noiseSuppression.enable = true;
 
 Rebuild, and the "Noise Suppression" button on the Microphone panel
 (and on any Custom Conduit with "As Microphone" ticked) becomes
-functional — picking a method there is instant after that, no further
-rebuilds needed.
+functional. Unlike the two main virtual devices, nothing is
+statically declared beyond that one option — picking a method spawns
+a small dedicated PipeWire helper process for exactly that one thing,
+and switching back to None (or removing whatever was using it) kills
+it again. Nothing extra sits in your graph the rest of the time.
+Expect a brief (~1-2 second) delay the first time you pick a method
+for something, since it's starting a fresh process rather than
+grabbing a pre-warmed one.
 
 - **RNNoise** — a dedicated neural-network denoiser (needs nixpkgs'
   `rnnoise-plugin` package, pulled in automatically once the option
   above is enabled). The better-quality option.
 - **WebRTC** — PipeWire's built-in noise suppression, no extra package
   needed, but per real-world reports noticeably weaker than RNNoise.
-  Included as a no-extra-dependency fallback -- costs more nodes than
-  RNNoise per slot (4 vs 2, since the underlying echo-cancel module
-  needs an echo-reference sink/playback pair even though nothing
-  actually feeds it in this standalone use), which is what shows up as
-  "Echo Cancel" entries in qpwgraph.
+  Included as a no-extra-dependency fallback. Each instance still
+  costs 4 nodes rather than RNNoise's 2 (the underlying echo-cancel
+  module requires an echo-reference sink/playback pair even though
+  nothing feeds it in this standalone use, which is what shows up as
+  "Echo Cancel" entries in qpwgraph) — but only while something is
+  actually using it, not permanently.
 
-Both are enabled by default, but if you only want one:
-
-```nix
-services.conduit.noiseSuppression.methods = [ "rnnoise" ];
-```
-
-drops the other pool entirely rather than leaving it provisioned and
-unused — worth doing if you've settled on RNNoise and don't need the
-fallback, since it removes real always-present nodes from your graph.
-
-Under the hood, this reserves a small fixed pool of processors (4 of
-each *enabled* method by default — `services.conduit.noiseSuppression.poolSize`
-to change it) rather than one per user, since the number of Custom
-Conduits is unbounded but the statically-declared processors aren't.
-Realistically this only matters if you have more than 4 things
-simultaneously wanting the *same* method at once — the Virtual Mic
-plus several Custom Conduits, say.
+Every consumer (the Virtual Mic, each Custom Conduit) gets its own
+fully independent instance, even if two things pick the same method
+at once — never shared, since sharing would mean their audio gets
+mixed together *inside* the processor before either is denoised.
 
 For the Microphone panel specifically, turning this on doesn't just
 affect explicit **Output** entries — it also becomes what apps get
@@ -288,6 +278,23 @@ journalctl --user -u conduit-daemon -n 300 --no-pager | grep -i vencord
 ports at that moment (e.g. queried before or after the app that owns
 it finished setting it up) -- restart the daemon while the device is
 actually active and check again.
+
+If a Noise Suppression selection doesn't seem to be doing anything,
+the daemon logs every spawn/stop of its helper processes:
+
+```fish
+journalctl --user -u conduit-daemon -n 100 --no-pager | grep -i "noise suppression\|ns_"
+```
+
+You should see a "started <method> noise suppression for ..." line
+with a pid, and its stderr (if the spawned `pipewire` process itself
+hit an error -- bad plugin path, missing library) shows up in this
+same log, since it inherits the daemon's own stdout/stderr rather than
+being silenced. No such line at all means `sync_noise_processors`
+never tried -- check that `services.conduit.noiseSuppression.enable`
+is actually set and rebuilt, and for RNNoise specifically that
+`CONDUIT_RNNOISE_LADSPA_PATH` reached the daemon's environment
+(`systemctl --user show conduit-daemon -p Environment`).
 
 If `nixos-rebuild` fails on a fresh clone with an error about
 `environment.etc."pipewire<...>"` no longer being supported, you're on

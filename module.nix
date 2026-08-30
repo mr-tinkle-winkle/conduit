@@ -78,76 +78,16 @@ let
     categories = [ "AudioVideo" "Audio" ];
   };
 
-  # A fixed-size pool of noise-suppression processors per method, rather
-  # than one dynamically created per consumer -- this keeps the DSP part
-  # (the genuinely complex bit, filter-chain plugin graphs) in the same
-  # statically-declared, once-verified pattern as the two main virtual
-  # devices, instead of attempting to load filter-chain modules live at
-  # runtime the way Custom Conduits create their plain adapter nodes.
-  # The daemon allocates a free slot to whatever currently wants it and
-  # links through it -- see conduit_daemon.py's NOISE SUPPRESSION
-  # section. 4 of each is enough for realistic simultaneous use (the
-  # Virtual Mic plus a few Custom Conduits); raise noiseSuppressionPoolSize
-  # if you genuinely need more.
-  noiseSuppressionPoolSize = cfg.noiseSuppression.poolSize;
-  noiseSuppressionMethods = cfg.noiseSuppression.methods;
-
-  # RNNoise (via the LADSPA plugin in nixpkgs' rnnoise-plugin package) --
-  # the higher-quality of the two options, a dedicated neural-network
-  # denoiser with no other side effects.
-  rnnoiseProcessors = lib.optionals (lib.elem "rnnoise" noiseSuppressionMethods) (lib.genList (i:
-    let n = toString (i + 1); in {
-      name = "libpipewire-module-filter-chain";
-      args = {
-        "node.description" = "Conduit Noise Suppression (RNNoise) ${n}";
-        "filter.graph" = {
-          nodes = [{
-            type = "ladspa";
-            name = "rnnoise";
-            plugin = "${pkgs.rnnoise-plugin.ladspa}/lib/ladspa/librnnoise_ladspa.so";
-            label = "noise_suppressor_stereo";
-            control = { "VAD Threshold (%)" = 50.0; };
-          }];
-        };
-        "capture.props" = {
-          "node.name" = "conduit_ns_rnnoise_${n}_in";
-          "media.class" = "Audio/Sink";
-          "audio.position" = [ "FL" "FR" ];
-        };
-        "playback.props" = {
-          "node.name" = "conduit_ns_rnnoise_${n}_out";
-          "media.class" = "Audio/Source";
-          "audio.position" = [ "FL" "FR" ];
-        };
-      };
-    }
-  ) noiseSuppressionPoolSize);
-
-  # WebRTC's built-in noise suppression, riding on PipeWire's own
-  # echo-cancel module rather than a separate plugin -- no extra package
-  # needed, but per real-world reports it's noticeably weaker than
-  # RNNoise (see README), and each pool slot costs FOUR nodes (capture,
-  # source, plus an unused sink/playback pair the module requires even
-  # though nothing feeds them) versus RNNoise's two, which adds up fast
-  # in qpwgraph. Skip "webrtc" in noiseSuppression.methods if you don't
-  # specifically need the no-extra-package property. Used here in
-  # "standalone" mode: the sink/playback side that would normally carry
-  # the echo-reference signal is left completely unconnected, so nothing
-  # is actually echo-cancelled -- only the webrtc.noise_suppression
-  # effect applies.
-  webrtcProcessors = lib.optionals (lib.elem "webrtc" noiseSuppressionMethods) (lib.genList (i:
-    let n = toString (i + 1); in {
-      name = "libpipewire-module-echo-cancel";
-      args = {
-        "library.name" = "aec/libspa-aec-webrtc";
-        "aec.args" = "webrtc.noise_suppression=true webrtc.gain_control=true webrtc.high_pass_filter=true webrtc.voice_detection=false";
-        "capture.props" = { "node.name" = "conduit_ns_webrtc_${n}_in"; "node.passive" = true; };
-        "source.props" = { "node.name" = "conduit_ns_webrtc_${n}_out"; };
-        "sink.props" = { "node.name" = "conduit_ns_webrtc_${n}_sink_unused"; "node.passive" = true; };
-        "playback.props" = { "node.name" = "conduit_ns_webrtc_${n}_playback_unused"; "node.passive" = true; };
-      };
-    }
-  ) noiseSuppressionPoolSize);
+  # Noise suppression processors are created fully on-demand by the
+  # daemon (spawned as small dedicated `pipewire -c <config>`
+  # subprocesses, one per thing actually using noise suppression --
+  # see conduit_daemon.py's NOISE SUPPRESSION section for why this is
+  # safer to do dynamically than trying to load a filter-chain module
+  # into the running server, and why a static pool was the wrong call).
+  # All this option needs to provide statically is the one thing the
+  # daemon can't discover on its own: where the RNNoise LADSPA plugin
+  # actually lives in the Nix store.
+  rnnoiseLadspaPath = "${pkgs.rnnoise-plugin.ladspa}/lib/ladspa/librnnoise_ladspa.so";
 
 in
 {
@@ -167,35 +107,15 @@ in
     noiseSuppression = {
       enable = lib.mkEnableOption ''
         the Noise Suppression option in the Virtual Mic / Custom Conduit
-        popups, backed by a fixed pool of statically-declared RNNoise and
-        WebRTC-noise-suppression processors
+        popups. RNNoise (nixpkgs' rnnoise-plugin) is pulled in
+        automatically; WebRTC noise suppression rides on PipeWire's own
+        echo-cancel module and needs no extra package, but see the
+        README for why it's the weaker of the two. Both are created
+        fully on-demand by the daemon -- nothing extra exists in your
+        PipeWire graph until you actually pick a method for something,
+        and it's torn down again the moment you pick None or remove
+        whatever was using it.
       '';
-
-      methods = lib.mkOption {
-        type = lib.types.listOf (lib.types.enum [ "rnnoise" "webrtc" ]);
-        default = [ "rnnoise" "webrtc" ];
-        example = [ "rnnoise" ];
-        description = ''
-          Which pool(s) to actually provision. Each entry costs real,
-          always-present PipeWire nodes (2 per RNNoise slot, 4 per WebRTC
-          slot -- the WebRTC module requires an echo-reference sink/
-          playback pair even in standalone use, hence "Echo Cancel"
-          entries showing up in qpwgraph). If RNNoise alone covers what
-          you need, dropping "webrtc" here removes that pool entirely
-          rather than leaving it provisioned and unused.
-        '';
-      };
-
-      poolSize = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 4;
-        description = ''
-          How many simultaneous users of EACH method in noiseSuppression.methods
-          to provision for. Only the Virtual Mic and Custom Conduits with
-          "As Microphone" ticked can request noise suppression, so this
-          rarely needs to be more than a handful.
-        '';
-      };
     };
   };
 
@@ -261,12 +181,11 @@ in
     };
 
     # Only declared when explicitly opted into -- pulls in the
-    # rnnoise-plugin package and creates 2*poolSize extra PipeWire nodes
-    # that most people won't want by default.
-    services.pipewire.extraConfig.pipewire."11-conduit-noise-suppression" =
-      lib.mkIf cfg.noiseSuppression.enable {
-        "context.modules" = rnnoiseProcessors ++ webrtcProcessors;
-      };
+    # rnnoise-plugin package the daemon needs at runtime to spawn
+    # RNNoise instances on demand. No PipeWire config is declared here
+    # at all: unlike the two fixed virtual devices above, noise
+    # suppression has nothing statically present -- see
+    # conduit_daemon.py's NOISE SUPPRESSION section.
 
     # Ship both scripts declaratively, same as Puppetry -- the GUI
     # imports the daemon module at runtime, so both need to land
@@ -292,6 +211,14 @@ in
     # re-applies state.json from scratch -- that's the "reapply every
     # boot" half of the persistence story; wireplumber's own default
     # sink/source memory covers the rest between the two.
+    #
+    # KillMode = "control-group" matters specifically for noise
+    # suppression: the daemon spawns small dedicated `pipewire -c
+    # <config>` helper processes on demand (its own children), and
+    # without control-group kill mode, stopping/restarting this service
+    # would leave those orphaned and running instead of cleaning them
+    # up -- exactly the kind of leak the on-demand design is meant to
+    # avoid.
     systemd.user.services.conduit-daemon = {
       description = "Conduit virtual mic/speaker router";
       wantedBy = [ "default.target" ];
@@ -300,7 +227,11 @@ in
         ExecStart = "${daemonPython}/bin/python3 /etc/conduit/conduit_daemon.py";
         Restart = "on-failure";
         RestartSec = 2;
-        Environment = "PYTHONUNBUFFERED=1";
+        KillMode = "control-group";
+        Environment = [
+          "PYTHONUNBUFFERED=1"
+        ] ++ lib.optional cfg.noiseSuppression.enable
+          "CONDUIT_RNNOISE_LADSPA_PATH=${rnnoiseLadspaPath}";
       };
     };
   };

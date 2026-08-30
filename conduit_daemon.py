@@ -196,15 +196,34 @@ NOISE SUPPRESSION
 Only the Virtual Mic and a Custom Conduit with "As Microphone" ticked
 can request this (state["mic"]["noise_suppression"] and each custom
 conduit's "mic_noise_suppression", both "none" | "rnnoise" | "webrtc").
-Unlike everything else that's created dynamically, the actual DSP
-processors are a FIXED POOL of statically nix-declared nodes (see
-module.nix's noiseSuppression option) -- filter-chain plugin graphs are
-too complex to trust loading dynamically without a live PipeWire
-instance to verify against, unlike the simple adapter nodes Custom
-Conduits and gain nodes use. The daemon's job is just to allocate a
-free pool slot to whoever's asking and route through it -- plain
-pw-link rewiring, the same mechanism proven everywhere else in this
-file.
+
+Unlike the fixed pool this used to be, these processors are created
+fully on demand: nothing extra exists in the PipeWire graph until
+something actually picks a method, and it's torn down the moment that
+switches back to "none" or the consumer goes away. A filter-chain (for
+RNNoise) or echo-cancel (for WebRTC) module is too complex a plugin
+graph to trust loading dynamically INTO the running PipeWire server
+without a live instance to verify the exact syntax against -- unlike
+the plain adapter nodes Custom Conduits and gain nodes use, which is
+why those got a simpler dynamic story. Instead, each active request
+gets its own small dedicated `pipewire -c <generated config>`
+subprocess -- the officially documented way to run an ad-hoc filter
+chain -- which connects to the main session as a normal client and
+contributes its two nodes (an input sink, an output source) into the
+shared graph for as long as it's running. Killing that process removes
+both nodes cleanly.
+
+Every consumer gets its own fully independent instance, never shared --
+sharing one processor between two different audio sources would mean
+their signals get mixed together *inside* the processor before either
+is denoised, which is wrong regardless of how convenient sharing a pool
+slot would be.
+
+Processor names are derived directly and deterministically from the
+consumer's own key ("mic", or "custom.<id>") plus method, e.g.
+"conduit_ns_mic_rnnoise_in"/"_out" -- no shared numbered pool to ever
+assign inconsistently between a consumer's input and output side (the
+failure mode the old pool design was vulnerable to).
 
 For the Virtual Mic specifically, the processor's OUTPUT node becomes
 the system default audio source (instead of Virtual Mic itself) and
@@ -214,20 +233,22 @@ route Conduit set up, either way it gets denoised audio. For a Custom
 Conduit, the processor sits between the base node and the as_microphone
 tap node instead of the tap linking directly to the base.
 
-Slot assignment is a simple sorted-list index over current requesters,
-recomputed fresh each cycle -- simple, but means an unrelated
-requester's slot CAN shift (a brief relink) when the SET of active
-requesters changes, not just when its own request changes. Given this
-is realistically used by a handful of things at once, that's an
-accepted tradeoff rather than something worth persisting slot
-assignments to avoid.
+The subprocesses are tracked in the in-memory _NS_PROCESSES dict for as
+long as this daemon process runs; a daemon restart (which happens on
+every config save) relies on the systemd unit's KillMode=control-group
+to kill any still-running children along with it, so a fresh daemon
+start can safely assume none are running and simply spawns whatever
+state.json currently wants.
 """
 
+import atexit
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -255,15 +276,24 @@ DEFAULT_STATE = {
     "custom": {"next_id": 1, "conduits": []},
 }
 
-# Must match module.nix's services.conduit.noiseSuppression.poolSize
-# (default there is also 4) -- these are two sides of the same
-# statically-declared pool, so they have to agree on its size.
 NOISE_SUPPRESSION_METHODS = ("rnnoise", "webrtc")
-NOISE_SUPPRESSION_POOL_SIZE = 4
+_RNNOISE_LADSPA_PATH = os.environ.get("CONDUIT_RNNOISE_LADSPA_PATH")
+
+# consumer_key -> {"popen": Popen, "config_path": Path} for every
+# currently-running noise-suppression subprocess. In-memory only --
+# see the module docstring's NOISE SUPPRESSION section for why that's
+# fine across daemon restarts.
+_NS_PROCESSES = {}
+_NS_CONFIG_DIR = Path(tempfile.gettempdir()) / "conduit-noise-suppression"
 
 
-def noise_processor_names(method, slot):
-    return (f"conduit_ns_{method}_{slot}_in", f"conduit_ns_{method}_{slot}_out")
+def noise_processor_names(consumer_key, method):
+    """Deterministic technical node names for one consumer's processor --
+    no shared pool slot to ever assign inconsistently between a
+    consumer's input and output side."""
+    safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", consumer_key)
+    base = f"conduit_ns_{safe_key}_{method}"
+    return (f"{base}_in", f"{base}_out")
 
 
 def custom_node_name(conduit_id):
@@ -699,19 +729,155 @@ def collect_noise_requests(state):
     return requests
 
 
-def allocate_noise_processors(requests):
-    """Assign each requester a pool slot for its method, sorted by
-    consumer key for determinism. Returns {consumer_key: (in_name, out_name)}."""
-    alloc = {}
-    for method in NOISE_SUPPRESSION_METHODS:
-        consumers = sorted(key for key, m in requests.items() if m == method)
-        for i, key in enumerate(consumers):
-            if i >= NOISE_SUPPRESSION_POOL_SIZE:
-                print(f"conduit-daemon: no free {method} noise-suppression slot for {key!r} "
-                      f"(pool size {NOISE_SUPPRESSION_POOL_SIZE} exceeded)", flush=True)
-                continue
-            alloc[key] = noise_processor_names(method, i + 1)
-    return alloc
+def _consumer_description(state, consumer_key):
+    if consumer_key == "mic":
+        return "Conduit Virtual Mic"
+    for conduit in state.get("custom", {}).get("conduits", []):
+        if f"custom.{conduit['id']}" == consumer_key:
+            return conduit.get("name") or consumer_key
+    return consumer_key
+
+
+_NS_PREREQ_MODULES = """\
+    { name = libpipewire-module-rt args = { } flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+"""
+
+
+def _generate_rnnoise_config(in_name, out_name, description):
+    description = _sanitize_description(description)
+    return f"""
+context.modules = [
+{_NS_PREREQ_MODULES}    {{ name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "Conduit Noise Suppression (RNNoise) - {description}"
+            filter.graph = {{
+                nodes = [
+                    {{
+                        type = ladspa
+                        name = rnnoise
+                        plugin = "{_RNNOISE_LADSPA_PATH}"
+                        label = noise_suppressor_stereo
+                        control = {{ "VAD Threshold (%)" = 50.0 }}
+                    }}
+                ]
+            }}
+            capture.props = {{
+                node.name = "{in_name}"
+                media.class = Audio/Sink
+                audio.position = [ FL FR ]
+            }}
+            playback.props = {{
+                node.name = "{out_name}"
+                media.class = Audio/Source
+                audio.position = [ FL FR ]
+            }}
+        }}
+    }}
+]
+"""
+
+
+def _generate_webrtc_config(in_name, out_name, description):
+    description = _sanitize_description(description)
+    return f"""
+context.modules = [
+{_NS_PREREQ_MODULES}    {{ name = libpipewire-module-echo-cancel
+        args = {{
+            library.name = aec/libspa-aec-webrtc
+            aec.args = "webrtc.noise_suppression=true webrtc.gain_control=true webrtc.high_pass_filter=true webrtc.voice_detection=false"
+            capture.props = {{ node.name = "{in_name}" node.description = "Conduit Noise Suppression (WebRTC) - {description}" node.passive = true }}
+            source.props = {{ node.name = "{out_name}" node.description = "Conduit Noise Suppression (WebRTC) - {description}" }}
+            sink.props = {{ node.name = "{in_name}_sink_unused" node.passive = true }}
+            playback.props = {{ node.name = "{in_name}_playback_unused" node.passive = true }}
+        }}
+    }}
+]
+"""
+
+
+def _start_noise_processor(consumer_key, method, description):
+    key = (consumer_key, method)
+    if key in _NS_PROCESSES:
+        return
+    in_name, out_name = noise_processor_names(consumer_key, method)
+
+    if method == "rnnoise":
+        if not _RNNOISE_LADSPA_PATH:
+            print(f"conduit-daemon: can't start RNNoise for {consumer_key!r} -- "
+                  f"CONDUIT_RNNOISE_LADSPA_PATH isn't set (is "
+                  f"services.conduit.noiseSuppression.enable on, and rebuilt?)", flush=True)
+            return
+        config_text = _generate_rnnoise_config(in_name, out_name, description)
+    elif method == "webrtc":
+        config_text = _generate_webrtc_config(in_name, out_name, description)
+    else:
+        return
+
+    _NS_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config_path = _NS_CONFIG_DIR / f"{in_name}.conf"
+    config_path.write_text(config_text)
+    try:
+        # Inherits our own stdout/stderr (journald, via systemd) rather
+        # than being silenced -- if the config is wrong, that's where
+        # the actual PipeWire error will show up.
+        popen = subprocess.Popen(["pipewire", "-c", str(config_path)])
+    except FileNotFoundError:
+        print("conduit-daemon: pipewire binary not found on PATH, can't start noise suppression", flush=True)
+        return
+    _NS_PROCESSES[key] = {"popen": popen, "config_path": config_path}
+    print(f"conduit-daemon: started {method} noise suppression for {consumer_key!r} "
+          f"(pid {popen.pid}, nodes {in_name!r}/{out_name!r})", flush=True)
+
+
+def _stop_noise_processor(consumer_key, method):
+    key = (consumer_key, method)
+    entry = _NS_PROCESSES.pop(key, None)
+    if entry is None:
+        return
+    popen = entry["popen"]
+    popen.terminate()
+    try:
+        popen.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        popen.kill()
+        try:
+            popen.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        entry["config_path"].unlink(missing_ok=True)
+    except OSError:
+        pass
+    print(f"conduit-daemon: stopped {method} noise suppression for {consumer_key!r}", flush=True)
+
+
+def _cleanup_all_noise_processors():
+    for consumer_key, method in list(_NS_PROCESSES.keys()):
+        _stop_noise_processor(consumer_key, method)
+
+
+atexit.register(_cleanup_all_noise_processors)
+
+
+def sync_noise_processors(state):
+    """Ensure exactly the currently-requested noise-suppression
+    processors are running: start anything newly requested, stop
+    anything no longer wanted (method changed back to none, consumer
+    disabled/removed, or switched to the other method -- a different
+    process either way, so that's a stop-old-start-new)."""
+    requests = collect_noise_requests(state)
+    desired = {(key, method) for key, method in requests.items()}
+
+    for key, method in list(_NS_PROCESSES.keys()):
+        if (key, method) not in desired:
+            _stop_noise_processor(key, method)
+
+    for key, method in desired:
+        if (key, method) not in _NS_PROCESSES:
+            _start_noise_processor(key, method, _consumer_description(state, key))
 
 
 # ---------------------------------------------------------------------------
@@ -742,7 +908,6 @@ def compute_desired_links(state, nodes):
     desired = set()
     managed_node_pairs = set()
     gain_specs = enumerate_gain_specs(state)
-    noise_alloc = allocate_noise_processors(collect_noise_requests(state))
 
     virtual_speaker = find_virtual(nodes, VIRTUAL_SPEAKER)
     virtual_mic = find_virtual(nodes, VIRTUAL_MIC)
@@ -817,16 +982,18 @@ def compute_desired_links(state, nodes):
     # a source) -- see module.nix for why one node covers both roles.
     mic_effective_source = virtual_mic
     if virtual_mic:
-        # If noise suppression is requested and its pool slot's processor
-        # nodes actually exist (nix option enabled + rebuilt), splice it
-        # in: Virtual Mic's own output feeds the processor's input, and
-        # the processor's output becomes what everything downstream --
+        # If noise suppression is requested and its processor is
+        # currently running (sync_noise_processors spawns/kills these as
+        # a separate step -- see the module docstring), splice it in:
+        # Virtual Mic's own output feeds the processor's input, and the
+        # processor's output becomes what everything downstream --
         # mic.outputs entries AND the system default source -- reads
         # from instead of Virtual Mic directly.
-        mic_ns_names = noise_alloc.get("mic")
-        if mic_ns_names:
-            processor_in = find_virtual(nodes, mic_ns_names[0])
-            processor_out = find_virtual(nodes, mic_ns_names[1])
+        mic_method = state["mic"].get("noise_suppression", "none")
+        if mic_method in NOISE_SUPPRESSION_METHODS:
+            in_name, out_name = noise_processor_names("mic", mic_method)
+            processor_in = find_virtual(nodes, in_name)
+            processor_out = find_virtual(nodes, out_name)
             if processor_in:
                 for pair in pair_ports(virtual_mic.output_ports, processor_in.input_ports):
                     desired.add(pair)
@@ -914,10 +1081,11 @@ def compute_desired_links(state, nodes):
             mic_tap = find_virtual(nodes, custom_mic_node_name(cid))
             if mic_tap:
                 tap_source = base
-                ns_names = noise_alloc.get(f"custom.{cid}")
-                if ns_names:
-                    processor_in = find_virtual(nodes, ns_names[0])
-                    processor_out = find_virtual(nodes, ns_names[1])
+                conduit_method = conduit.get("mic_noise_suppression", "none")
+                if conduit_method in NOISE_SUPPRESSION_METHODS:
+                    in_name, out_name = noise_processor_names(f"custom.{cid}", conduit_method)
+                    processor_in = find_virtual(nodes, in_name)
+                    processor_out = find_virtual(nodes, out_name)
                     if processor_in:
                         for pair in pair_ports(base.output_ports, processor_in.input_ports):
                             desired.add(pair)
@@ -1107,6 +1275,7 @@ def main():
 
                 sync_custom_conduits(state, nodes)
                 sync_gain_nodes(enumerate_gain_specs(state), nodes)
+                sync_noise_processors(state)
                 mic_effective_source = reconcile(state, nodes, dump)
                 enforce_defaults(nodes, mic_effective_source)
         except Exception:

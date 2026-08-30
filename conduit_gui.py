@@ -64,6 +64,17 @@ class NoScrollComboBox(QComboBox):
     def wheelEvent(self, event):
         event.ignore()
 
+    def showPopup(self):
+        # Widen just the popup list to fit the longest item's full text,
+        # regardless of how narrow the closed box itself is -- Qt's
+        # default popup width tracks the closed box's width, which would
+        # otherwise elide items in the OPEN list too, defeating the
+        # point of opening it to see the full name.
+        fm = self.fontMetrics()
+        longest = max((fm.horizontalAdvance(self.itemText(i)) for i in range(self.count())), default=0)
+        self.view().setMinimumWidth(longest + 48)  # padding for margins/scrollbar
+        super().showPopup()
+
     def _update_tooltip(self, _index):
         self.setToolTip(self.currentText())
 
