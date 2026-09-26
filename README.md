@@ -202,6 +202,9 @@ Each Custom Conduit gets:
   Auto-Detect popup, all of it). Route anything into a conduit, then
   out to anything else, including chaining one custom conduit into
   another.
+- **Vol / Mute** — the conduit's own overall volume and mute, separate
+  from any per-entry volume in its Input/Output lists. Same free-text,
+  no-limit volume field as the Speaker/Mic panels (see below).
 - **✕ Remove** deletes the whole conduit and tears down its
   connections.
 
@@ -216,6 +219,43 @@ hood this is a quick destroy-and-recreate with the new name; any
 connections through it get torn down and rebuilt automatically as
 part of that, the same brief interruption any other config change
 already causes.
+
+## Master Volume and Mute
+
+The Speaker and Microphone panels each have a **Vol** field and a
+**Mute** checkbox in their header — the device's overall volume,
+distinct from any per-entry volume multiplier inside their Input/
+Output/Bypass lists. Unlike those (a bounded 0.00x–10.00x spinner),
+this is a plain text field with no upper limit — type whatever
+multiplier you want. Volume of exactly `1.0` is left alone entirely
+(same "not managing this" convention as everywhere else); mute is
+always actively held either way, continuously re-applied every
+reconcile cycle just like everything else in this app that's meant to
+stay pinned rather than drift.
+
+Every Custom Conduit has the same Vol/Mute pair for its own base
+device (see above).
+
+### Command-line flags
+
+The same volume and mute controls are scriptable without opening the
+GUI at all — useful for binding to a hotkey:
+
+```fish
+conduit --micVolume=0.5          # set the Microphone panel's overall volume
+conduit --speakerVolume=2.0      # set the Speaker panel's overall volume
+conduit --mute=mic               # mute the microphone
+conduit --unmute=speaker         # unmute the speaker
+conduit --togglemute="Game Mix"  # toggle mute on a Custom Conduit by name
+```
+
+`--mute` / `--unmute` / `--togglemute` take a target: `speaker`, `mic`,
+or a Custom Conduit's name (quote it if it has spaces). Running any of
+these applies the change and exits immediately without opening a
+window — the GUI only opens when `conduit` is run with no flags at
+all. Getting the target wrong (or leaving it off) prints the list of
+currently valid targets and exits with an error rather than guessing.
+
 ## Noise Suppression
 
 Needs a one-time opt-in in your NixOS config before it's usable at
@@ -348,7 +388,9 @@ changes:
       }
     ],
     "outputs": [],
-    "noise_suppression": "rnnoise"
+    "noise_suppression": "rnnoise",
+    "volume": 1.0,
+    "muted": false
   },
   "speaker": {
     "inputs": [],
@@ -359,7 +401,9 @@ changes:
     "bypass": [
       {"label": "Spotify", "enabled": true, "volume": 1.5, "mono": false, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}}
     ],
-    "bypass_target": "Analog Stereo Speakers"
+    "bypass_target": "Analog Stereo Speakers",
+    "volume": 1.0,
+    "muted": false
   },
   "custom": {
     "next_id": 2,
@@ -370,6 +414,8 @@ changes:
         "as_speaker": true,
         "as_microphone": true,
         "mic_noise_suppression": "webrtc",
+        "volume": 1.0,
+        "muted": false,
         "inputs": [],
         "outputs": []
       }

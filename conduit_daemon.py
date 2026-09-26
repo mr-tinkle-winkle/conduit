@@ -258,7 +258,11 @@ STATE_FILE = CONFIG_DIR / "state.json"
 LINK_CACHE_FILE = CONFIG_DIR / ".link_cache.json"
 
 POLL_INTERVAL = 2  # seconds between graph reconciliation passes
-VOLUME_BOOST_LIMIT = 10.0  # ceiling passed to `wpctl set-volume -l`, allows >100%
+VOLUME_BOOST_LIMIT = 10.0  # ceiling passed to `wpctl set-volume -l` for per-entry volumes
+MASTER_VOLUME_BOOST_LIMIT = 1000.0  # per-device list entries are capped at 10x in the GUI,
+# but the master Speaker/Mic/Custom-Conduit volume is explicitly "no limits" text entry --
+# this is the practical ceiling passed to wpctl's own -l flag, high enough it never clips
+# anything a person would reasonably type.
 
 VIRTUAL_SPEAKER = "conduit_virtual_speaker"
 VIRTUAL_MIC = "conduit_virtual_mic"
@@ -271,8 +275,8 @@ DEFAULT_AUTO_DETECT = {
 }
 
 DEFAULT_STATE = {
-    "mic": {"inputs": [], "outputs": [], "noise_suppression": "none"},
-    "speaker": {"inputs": [], "outputs": [], "bypass": [], "bypass_target": None},
+    "mic": {"inputs": [], "outputs": [], "noise_suppression": "none", "volume": 1.0, "muted": False},
+    "speaker": {"inputs": [], "outputs": [], "bypass": [], "bypass_target": None, "volume": 1.0, "muted": False},
     "custom": {"next_id": 1, "conduits": []},
 }
 
@@ -359,6 +363,13 @@ def _migrate_items(loaded):
     return []
 
 
+def _valid_float(value, default=1.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def load_state():
     try:
         data = json.loads(STATE_FILE.read_text())
@@ -370,12 +381,16 @@ def load_state():
     state["mic"]["outputs"] = _migrate_items(mic.get("outputs"))
     mic_ns = mic.get("noise_suppression")
     state["mic"]["noise_suppression"] = mic_ns if mic_ns in ("none",) + NOISE_SUPPRESSION_METHODS else "none"
+    state["mic"]["volume"] = _valid_float(mic.get("volume"), 1.0)
+    state["mic"]["muted"] = bool(mic.get("muted", False))
     speaker = data.get("speaker", {}) if isinstance(data.get("speaker"), dict) else {}
     state["speaker"]["inputs"] = _migrate_items(speaker.get("inputs"))
     state["speaker"]["outputs"] = _migrate_items(speaker.get("outputs"))
     state["speaker"]["bypass"] = _migrate_items(speaker.get("bypass"))
     if speaker.get("bypass_target"):
         state["speaker"]["bypass_target"] = speaker["bypass_target"]
+    state["speaker"]["volume"] = _valid_float(speaker.get("volume"), 1.0)
+    state["speaker"]["muted"] = bool(speaker.get("muted", False))
 
     custom = data.get("custom", {}) if isinstance(data.get("custom"), dict) else {}
     raw_conduits = custom.get("conduits", []) if isinstance(custom.get("conduits"), list) else []
@@ -392,6 +407,8 @@ def load_state():
             "as_speaker": bool(entry.get("as_speaker", True)),
             "as_microphone": bool(entry.get("as_microphone", False)),
             "mic_noise_suppression": conduit_ns if conduit_ns in ("none",) + NOISE_SUPPRESSION_METHODS else "none",
+            "volume": _valid_float(entry.get("volume"), 1.0),
+            "muted": bool(entry.get("muted", False)),
             "inputs": _migrate_items(entry.get("inputs")),
             "outputs": _migrate_items(entry.get("outputs")),
         })
@@ -1243,6 +1260,42 @@ def enforce_defaults(nodes, mic_default_node=None):
         subprocess.run(["wpctl", "set-default", str(target.id)], capture_output=True)
 
 
+def _apply_master_control(node, volume, muted):
+    """Continuously pin one device's own overall volume/mute -- the
+    master Speaker/Mic/Custom-Conduit-level control, distinct from a
+    per-entry volume in one of the Input/Output/Bypass lists. volume ==
+    1.0 is left alone (same "not managing this" convention as per-entry
+    volume); mute is always explicitly enforced either way, since a
+    mute toggle is meaningless unless both states are actively held."""
+    if node is None:
+        return
+    if volume != 1.0:
+        subprocess.run(
+            ["wpctl", "set-volume", str(node.id), f"{volume}", "-l", str(MASTER_VOLUME_BOOST_LIMIT)],
+            capture_output=True,
+        )
+    subprocess.run(["wpctl", "set-mute", str(node.id), "1" if muted else "0"], capture_output=True)
+
+
+def enforce_master_controls(state, nodes):
+    _apply_master_control(
+        find_virtual(nodes, VIRTUAL_SPEAKER),
+        state["speaker"].get("volume", 1.0),
+        state["speaker"].get("muted", False),
+    )
+    _apply_master_control(
+        find_virtual(nodes, VIRTUAL_MIC),
+        state["mic"].get("volume", 1.0),
+        state["mic"].get("muted", False),
+    )
+    for conduit in state.get("custom", {}).get("conduits", []):
+        _apply_master_control(
+            find_virtual(nodes, custom_node_name(conduit["id"])),
+            conduit.get("volume", 1.0),
+            conduit.get("muted", False),
+        )
+
+
 # ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
@@ -1278,6 +1331,7 @@ def main():
                 sync_noise_processors(state)
                 mic_effective_source = reconcile(state, nodes, dump)
                 enforce_defaults(nodes, mic_effective_source)
+                enforce_master_controls(state, nodes)
         except Exception:
             # Belt-and-suspenders: a silently-dying loop is much harder to
             # debug than a noisy one. Print the full traceback and keep

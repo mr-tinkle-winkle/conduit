@@ -22,6 +22,7 @@ an accumulating list.
 Requires conduit_daemon.py to be importable (same directory by default).
 """
 
+import argparse
 import json
 import subprocess
 import sys
@@ -30,6 +31,126 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import conduit_daemon as cd
 
+PLACEHOLDER = "Add a device or app…"
+DESTINATION_PLACEHOLDER = "Select destination…"
+RESTART_DEBOUNCE_MS = 600
+
+
+# ---------------------------------------------------------------------------
+# Command-line control: `conduit --micVolume=0.5`, `conduit --mute=speaker`,
+# etc. Handled before any Qt import happens below (PySide6 classes are
+# defined at module scope further down, so importing PySide6 itself can't
+# be deferred past them -- but skipping QApplication/window creation
+# entirely for a CLI-only invocation is what actually avoids opening a
+# window and most of the real startup cost). See README's "Command-line
+# flags" section for the full list.
+# ---------------------------------------------------------------------------
+
+def _valid_targets(state):
+    names = ["speaker", "mic"]
+    for conduit in state.get("custom", {}).get("conduits", []):
+        names.append(conduit.get("name") or f"Custom Conduit {conduit['id']}")
+    return names
+
+
+def _resolve_target(state, target):
+    """Return the mutable dict for "speaker" / "mic" / a Custom Conduit
+    matched by exact name (case-insensitive) or by "custom.<id>" /
+    "custom:<id>" / a bare id -- or None if nothing matches."""
+    t = target.strip()
+    tl = t.lower()
+    if tl == "speaker":
+        return state["speaker"]
+    if tl == "mic":
+        return state["mic"]
+    for conduit in state.get("custom", {}).get("conduits", []):
+        name = (conduit.get("name") or f"Custom Conduit {conduit['id']}").strip().lower()
+        if tl == name or t in (f"custom.{conduit['id']}", f"custom:{conduit['id']}", str(conduit["id"])):
+            return conduit
+    return None
+
+
+def _save_state_and_restart(state):
+    cd.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    cd.STATE_FILE.write_text(json.dumps(state, indent=2))
+    subprocess.run(["systemctl", "--user", "restart", "conduit-daemon.service"], capture_output=True)
+
+
+def _build_cli_parser():
+    parser = argparse.ArgumentParser(
+        prog="conduit", add_help=True,
+        description="Conduit -- run with no flags to open the GUI, or use one of these for quick "
+                    "scripted/hotkey control without opening a window.",
+    )
+    parser.add_argument("--micVolume", type=float, metavar="MULTIPLIER",
+                         help="Set the Microphone panel's overall volume multiplier (e.g. 0.01, 2.5). No range limit.")
+    parser.add_argument("--speakerVolume", type=float, metavar="MULTIPLIER",
+                         help="Set the Speaker panel's overall volume multiplier. No range limit.")
+    parser.add_argument("--mute", nargs="?", const="", metavar="TARGET",
+                         help="Mute TARGET: 'speaker', 'mic', or a Custom Conduit's name.")
+    parser.add_argument("--unmute", nargs="?", const="", metavar="TARGET",
+                         help="Unmute TARGET (same target names as --mute).")
+    parser.add_argument("--togglemute", nargs="?", const="", metavar="TARGET",
+                         help="Toggle mute on TARGET (same target names as --mute).")
+    return parser
+
+
+def handle_cli_args(argv):
+    """If argv contains any recognized flag, apply it directly to
+    state.json and restart the daemon -- returns True (caller should
+    exit without opening the GUI). Returns False if nothing recognized,
+    so the normal GUI launches as if no arguments were given at all."""
+    parser = _build_cli_parser()
+    args, _unknown = parser.parse_known_args(argv)
+
+    flags = (args.micVolume, args.speakerVolume, args.mute, args.unmute, args.togglemute)
+    if all(f is None for f in flags):
+        return False
+
+    cd.ensure_config_exists()
+    state = cd.load_state()
+    changed = False
+
+    if args.micVolume is not None:
+        state["mic"]["volume"] = args.micVolume
+        print(f"conduit: mic volume set to {args.micVolume}")
+        changed = True
+
+    if args.speakerVolume is not None:
+        state["speaker"]["volume"] = args.speakerVolume
+        print(f"conduit: speaker volume set to {args.speakerVolume}")
+        changed = True
+
+    for flag_name, flag_value, mode in (
+        ("--mute", args.mute, "mute"),
+        ("--unmute", args.unmute, "unmute"),
+        ("--togglemute", args.togglemute, "toggle"),
+    ):
+        if flag_value is None:
+            continue
+        if not flag_value:
+            print(f"conduit: {flag_name} needs a target, e.g. {flag_name}=mic. "
+                  f"Available targets: {', '.join(_valid_targets(state))}", file=sys.stderr)
+            sys.exit(1)
+        entry = _resolve_target(state, flag_value)
+        if entry is None:
+            print(f"conduit: no target named {flag_value!r}. "
+                  f"Available targets: {', '.join(_valid_targets(state))}", file=sys.stderr)
+            sys.exit(1)
+        if mode == "mute":
+            entry["muted"] = True
+        elif mode == "unmute":
+            entry["muted"] = False
+        else:
+            entry["muted"] = not entry.get("muted", False)
+        print(f"conduit: {flag_value} {'muted' if entry['muted'] else 'unmuted'}")
+        changed = True
+
+    if changed:
+        _save_state_and_restart(state)
+    return True
+
+
 from PySide6.QtCore import Qt, QTimer, QPoint
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
@@ -37,10 +158,6 @@ from PySide6.QtWidgets import (
     QLabel, QComboBox, QListWidget, QListWidgetItem, QPushButton, QFrame,
     QCheckBox, QLineEdit, QDoubleSpinBox, QSystemTrayIcon, QMenu, QScrollArea,
 )
-
-PLACEHOLDER = "Add a device or app…"
-DESTINATION_PLACEHOLDER = "Select destination…"
-RESTART_DEBOUNCE_MS = 600
 
 
 class NoScrollComboBox(QComboBox):
@@ -473,6 +590,57 @@ class SingleSelectSection(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Master volume + mute for a whole device (Speaker, Mic, or a Custom
+# Conduit's own base node) -- distinct from a per-entry volume in one of
+# that device's Input/Output/Bypass lists. Volume is a free-text field
+# rather than a bounded spinbox, since this one is explicitly "no limits".
+# ---------------------------------------------------------------------------
+
+class MasterControlWidget(QWidget):
+    def __init__(self, on_change, parent=None):
+        super().__init__(parent)
+        self._on_change = on_change
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        layout.addWidget(QLabel("Vol:"))
+        self.volume_edit = QLineEdit("1.0")
+        self.volume_edit.setFixedWidth(56)
+        self.volume_edit.setToolTip("Volume multiplier -- 1.0 leaves it alone, no upper limit. "
+                                     "Also settable from the command line, e.g. conduit --micVolume=0.5")
+        self.volume_edit.editingFinished.connect(self._on_volume_edited)
+        layout.addWidget(self.volume_edit)
+
+        self.mute_cb = QCheckBox("Mute")
+        self.mute_cb.setToolTip("Also settable from the command line, e.g. conduit --togglemute=mic")
+        self.mute_cb.toggled.connect(self._on_change)
+        layout.addWidget(self.mute_cb)
+
+    def _on_volume_edited(self):
+        try:
+            float(self.volume_edit.text())
+        except ValueError:
+            self.volume_edit.setText("1.0")
+        self._on_change()
+
+    def volume(self):
+        try:
+            return float(self.volume_edit.text())
+        except ValueError:
+            return 1.0
+
+    def set_volume(self, value):
+        self.volume_edit.setText(str(value))
+
+    def muted(self):
+        return self.mute_cb.isChecked()
+
+    def set_muted(self, value):
+        self.mute_cb.setChecked(bool(value))
+
+
+# ---------------------------------------------------------------------------
 # One user-created "Custom Conduit" -- name (click to edit), As
 # Speaker / As Microphone checkboxes, and its own Input/Output lists.
 # See conduit_daemon's CUSTOM CONDUITS docstring section for what the
@@ -526,6 +694,12 @@ class CustomConduitBox(QFrame):
 
         outer.addLayout(header)
 
+        second_row = QHBoxLayout()
+        second_row.addStretch()
+        self.master = MasterControlWidget(self._on_change)
+        second_row.addWidget(self.master)
+        outer.addLayout(second_row)
+
         lists = QHBoxLayout()
         self.inputs = AddListSection("Input", self._on_change)
         self.outputs = AddListSection("Output", self._on_change)
@@ -553,6 +727,8 @@ class CustomConduitBox(QFrame):
         self.ns_btn.setEnabled(self.as_mic_cb.isChecked())
         self._mic_noise_suppression = conduit.get("mic_noise_suppression", "none")
         self.ns_btn.setText(_noise_suppression_button_text(self._mic_noise_suppression))
+        self.master.set_volume(conduit.get("volume", 1.0))
+        self.master.set_muted(conduit.get("muted", False))
         self.inputs.set_items(conduit.get("inputs", []))
         self.outputs.set_items(conduit.get("outputs", []))
 
@@ -564,6 +740,8 @@ class CustomConduitBox(QFrame):
             "as_speaker": self.as_speaker_cb.isChecked(),
             "as_microphone": self.as_mic_cb.isChecked(),
             "mic_noise_suppression": self._mic_noise_suppression,
+            "volume": self.master.volume(),
+            "muted": self.master.muted(),
             "inputs": self.inputs.items(),
             "outputs": self.outputs.items(),
         }
@@ -630,6 +808,11 @@ class ConduitWindow(QMainWindow):
         # --- Speaker panel (left) ---
         speaker_box = QGroupBox("Speaker")
         speaker_layout = QVBoxLayout(speaker_box)
+        speaker_header = QHBoxLayout()
+        speaker_header.addStretch()
+        self.speaker_master = MasterControlWidget(self._save)
+        speaker_header.addWidget(self.speaker_master)
+        speaker_layout.addLayout(speaker_header)
         self.speaker_inputs = AddListSection("Input", self._save)
         self.speaker_outputs = AddListSection("Output", self._save)
         self.speakers_target = SingleSelectSection("Destination", DESTINATION_PLACEHOLDER, self._save)
@@ -649,6 +832,8 @@ class ConduitWindow(QMainWindow):
         mic_layout = QVBoxLayout(mic_box)
         mic_header = QHBoxLayout()
         mic_header.addStretch()
+        self.mic_master = MasterControlWidget(self._save)
+        mic_header.addWidget(self.mic_master)
         self.mic_ns_btn = QPushButton(_noise_suppression_button_text("none"))
         self.mic_ns_btn.setFlat(True)
         self.mic_ns_btn.clicked.connect(self._open_mic_noise_suppression_popup)
@@ -793,10 +978,14 @@ class ConduitWindow(QMainWindow):
         self.mic_outputs.set_items(state["mic"]["outputs"])
         self._mic_noise_suppression = state["mic"].get("noise_suppression", "none")
         self.mic_ns_btn.setText(_noise_suppression_button_text(self._mic_noise_suppression))
+        self.mic_master.set_volume(state["mic"].get("volume", 1.0))
+        self.mic_master.set_muted(state["mic"].get("muted", False))
         self.speaker_inputs.set_items(state["speaker"]["inputs"])
         self.speaker_outputs.set_items(state["speaker"]["outputs"])
         self.speaker_bypass.set_items(state["speaker"]["bypass"])
         self.speakers_target.set_value(state["speaker"].get("bypass_target"))
+        self.speaker_master.set_volume(state["speaker"].get("volume", 1.0))
+        self.speaker_master.set_muted(state["speaker"].get("muted", False))
 
         custom = state.get("custom", {"next_id": 1, "conduits": []})
         self._next_custom_id = custom.get("next_id", 1)
@@ -818,12 +1007,16 @@ class ConduitWindow(QMainWindow):
                 "inputs": self.mic_inputs.items(),
                 "outputs": self.mic_outputs.items(),
                 "noise_suppression": self._mic_noise_suppression,
+                "volume": self.mic_master.volume(),
+                "muted": self.mic_master.muted(),
             },
             "speaker": {
                 "inputs": self.speaker_inputs.items(),
                 "outputs": self.speaker_outputs.items(),
                 "bypass": self.speaker_bypass.items(),
                 "bypass_target": self.speakers_target.value(),
+                "volume": self.speaker_master.volume(),
+                "muted": self.speaker_master.muted(),
             },
             "custom": {
                 "next_id": self._next_custom_id,
@@ -863,4 +1056,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if handle_cli_args(sys.argv[1:]):
+        sys.exit(0)
     main()
