@@ -2,11 +2,12 @@
 
 <img src="assets/conduit_logo.png" width="120" alt="Conduit logo" />
 
-A PipeWire virtual mic/speaker router for NixOS, with a Qt editor. Two
+A PipeWire virtual mic/speaker router for NixOS, with a node-graph editor. Two
 virtual devices — **Conduit Virtual Speaker** and **Conduit Virtual
 Mic** — get created system-wide and set as your defaults. You then
-patch real apps and real hardware in and out of them from a small GUI,
-and the routing survives reboots.
+patch real apps and real hardware in and out of them -- on a
+qpwgraph-style canvas or in the classic lists -- and the routing
+survives reboots.
 
 ## What it does
 
@@ -17,6 +18,10 @@ and the routing survives reboots.
 - Lets you **bypass** an app around the virtual speaker entirely —
   e.g. Spotify goes straight to your real speakers instead of through
   the mix.
+- Per-port links (just the left channel, a mono mic fanned to both),
+  per-link and per-device volume, blocks that silence a device or keep
+  a pair from ever being linked, and events ("when OBS starts
+  recording, block Spotify").
 - Everything is saved to `~/.config/conduit/state.json` and re-applied
   continuously by a background service, so replugging headphones or
   reopening an app doesn't lose the routing, and nothing needs to be
@@ -79,154 +84,141 @@ Log out and back in (the daemon is a per-user systemd service that
 starts with your session), then either run `conduit` from a terminal
 or find **Conduit** in your app launcher.
 
-## Using the GUI
+## The window
 
-Two panels: **Speaker** on the left, **Microphone** on the right.
+At the very top, **Graphical | List** switches between the two editors.
+Both edit the same config; switch whenever you like.
 
-- **Input** / **Output** dropdowns show whatever's currently eligible
-  — for an Input, anything that *produces* audio (a real mic, an
-  app that's currently playing sound); for an Output, anything that
-  *accepts* audio (a real speaker, an app that's listening). Pick one
-  and it's added to the list below; click the ✕ on a row to remove it.
-- **Speaker → Bypass**: pick an app here and it's disconnected from
-  the virtual speaker entirely, forced instead onto whatever's chosen
-  in the **Destination** dropdown right next to it (a single-device
-  picker, not a list) -- the two sit side by side since Destination
-  only does anything in conjunction with Bypass.
-- **Speaker → Output** and **Bypass → Destination** aren't limited
-  to physical hardware -- an app that wants to consume your mix (e.g.
-  Discord's screen-share audio capture) is fair game for Output too.
-  The Speakers picker specifically stays hardware-only, since that's
-  "your speakers" in the bypass sense.
-- **Every device row has a small `^` button** that opens a popup with
-  four combinable Auto-Detect strategies for sweeping in (or keeping
-  out) devices you didn't explicitly add. It's per-device, not
-  per-list, since a list often mixes real hardware (which never needs
-  this) with an app-created virtual device (which might):
-  - *Prefix match* -- treats "Chromium input-2" as the same device as
-    a saved "Chromium input" (strips a trailing counter/suffix before
-    comparing).
-  - *Keyword match* -- matches anything whose name contains the text
-    you type, e.g. "vencord".
-  - *Same source app* -- groups every stream created by the same
-    running app/process, however differently each one is named. Only
-    kicks in while the device this row was saved as is currently live,
-    since that's what supplies the reference to expand from.
-  - *Anti-Auto-Detect* -- the inverse: comma-separated keywords that
-    keep a matching device OUT of this row's sweep, even if it would
-    otherwise match prefix/keyword/same-app. Never removes the row's
-    own device, only auto-detected siblings.
+The toolbar keeps **Refresh devices**, **Auto Refresh Devices** (on by
+default -- it's what keeps the canvas's link colours live), **Show
+Unmanaged Links** (canvas only), **Auto-apply** and **Close to Tray**.
 
-  This is built for things like Discord/Vesktop, which spin up a
-  differently-named capture stream per screen share. Matches are
-  purely a routing-time decision -- they never get written back into
-  the visible list, so the GUI keeps showing only what you explicitly
-  added even as auto-detected devices come and go.
-- **Every device row has an enable checkbox** on the left -- unticking
-  it takes that device out of routing entirely (auto-detect included)
-  without deleting it, so it's a one-click toggle to bring back later.
-- **Every device row has a volume multiplier** (the "1.00x" spinbox) --
-  1.00x leaves the device's volume alone, 2.00x doubles it, 0.50x
-  halves it. It's continuously re-applied every couple of seconds, so
-  it always sits at exactly that level and overrides any manual
-  adjustment you make elsewhere (a system volume mixer, the app's own
-  volume slider, etc.). Only affects the exact device a row is saved
-  as, not any auto-detected siblings it sweeps in. Each row's multiplier
-  is fully independent, even for the same physical device added in two
-  different lists -- under the hood, a non-1.00x row gets its own tiny
-  dedicated volume-adjustment device inserted inline, rather than
-  changing the shared device's own volume (which would mean two
-  different multipliers on the same device fighting each other).
-- **Removing a device actually undoes its connections.** Conduit
-  remembers what it last connected across daemon restarts (which
-  happen on every save), so taking something out of a list -- or just
-  unticking its enable checkbox -- tears down the link it created
-  instead of leaving it connected until the next reboot.
-- **Auto Refresh Devices**, next to the manual Refresh button,
-  periodically re-checks for new/gone devices on its own (every few
-  seconds) instead of only refreshing when you click the button.
-- **Mono**, on every device row, treats that device as single-channel --
-  fanning it out to both stereo channels on the other side (or summing
-  a stereo signal down to it), instead of the normal one-to-one channel
-  matching that can otherwise leave one side silent for a genuinely
-  mono microphone.
-- **Noise Suppression**, on the Microphone panel and on any Custom
-  Conduit with "As Microphone" ticked, offers RNNoise or WebRTC's
-  built-in noise suppression. This one needs an extra step -- see
-  below.
-- **Close to Tray** hides the window and keeps the daemon-adjacent GUI
-  running in the system tray rather than quitting; click the tray icon
-  (or its "Open Conduit" menu entry) to bring the window back, or
-  "Quit" from the same menu to actually exit. The daemon itself is a
-  separate systemd service either way and keeps running regardless of
-  whether the GUI window, or the tray icon, is open at all.
-- Nothing needs an explicit "Save" — every change writes
-  `state.json` immediately and restarts the daemon (debounced by
-  ~600ms so rapid changes don't thrash it).
-- **Refresh devices** re-queries PipeWire for what's currently
-  running — apps only show up in the dropdowns while they're actively
-  playing/recording, so if something you want isn't listed yet, open
-  it first, then hit Refresh.
+**Auto-apply** (on by default) does what Conduit always did: every edit
+writes `state.json` and restarts the daemon (debounced ~600 ms). Turn it
+off and edits stay pending -- the top bar shows "● Unsaved changes" and a
+**Save** / **Discard** pair. Closing the window with pending edits asks
+whether to save them.
 
-### Example: Spotify bypassing the virtual speaker
+### Graphical editor
 
-1. Open Spotify and start playing something (so it shows up as an
-   eligible device).
-2. In the **Speaker** panel, pick **Analog Stereo Speakers** (or
-   whatever your real output is called) in the **Destination** dropdown.
-3. Pick **Spotify** in the **Bypass** dropdown.
+One canvas split into boxes: **Speaker** top-left, **Microphone**
+top-right, and each **Custom Conduit** in a row along the bottom. Drag
+the dividers to resize them. Each box has its own zoom (mouse wheel) and
+a **⛶** button that fills the window with that box (the same button or
+**Esc** restores).
 
-Spotify now goes straight to your real speakers; everything else you
-route through the virtual speaker still gets mixed normally.
+**Cells** are devices or app streams (matched by name, exactly like the
+old list entries). Each box has fixed **hub** cells: the Virtual
+Speaker, the Virtual Mic, and each Custom Conduit's sink (plus its mic
+when "As Microphone" is ticked). Ports are drawn like qpwgraph: **L** and
+**R** for stereo, one port for mono -- with a **Both** port behind L and
+R. Drag from Both and you get the left *and* right link in one go.
+
+| Do this | To |
+|---|---|
+| drag from a port to a port | link them (any output to any input, any box -- cell-to-cell links that skip the hubs are fine) |
+| drag a cell | move it; drop it on another box to move it there |
+| right-click empty canvas | **New Cell** (anything PipeWire has now, plus closed devices Conduit remembers), or in Speaker, **New Speaker** |
+| right-click a cell | Auto-Detect, Add Event, Volume, Recolor, Block, Real Speaker, Move to, Delete |
+| right-click a hub | enable / disable the box (a disabled box is dimmed and routes nothing), master volume, mute, noise suppression |
+| right-click a link | Volume, Recolor, Block, Delete (applies to all selected links) |
+| click / Shift-click a link, or drag a rectangle on empty canvas | select links; **Delete** removes them |
+| middle-click a cell or link | block / unblock it (middle-click never pans) |
+| Ctrl+drag empty canvas | pan (or use the scroll bars) |
+| double-click empty canvas | fit the box |
+
+**Link colours.** Gray: configured in Conduit but not linked in PipeWire
+(yet -- e.g. the device is closed). Once live: **blue** into a virtual
+device, **orange** out of a virtual device, **green** for an app linked
+straight to a real speaker (bypass), **yellow** for any other
+cell-to-cell link. **Very dark red**: blocked. Any link can be
+recoloured; a recoloured link still goes gray while it isn't live. A
+link volume shows as a gap in the line with the value in it; a cell's
+volume shows above the cell.
+
+**Cell states.** Blocked (very dark red) wins over everything: every
+PipeWire link of that device is removed -- including WirePlumber's own --
+so it's silent. Closed (the device doesn't exist right now): dimmed,
+purple. Inactive (exists, no audio flowing): dimmed. A small "also in
+…" line means the same device has another cell in another box.
+
+**Speakers and bypass.** *New Speaker* adds a real output device and
+links the Virtual Speaker to it; add as many as you like (speakers,
+headphones, earbuds) and middle-click whichever you want silenced.
+Linking an app straight to a speaker cell also creates a dark-red
+**anti-link** from that app to the Virtual Speaker, which keeps
+WirePlumber from also sending it into the mix. Delete the anti-link if
+you want both. (This replaces the old Bypass list and Destination
+picker.)
+
+**Volumes** on cells and links are inline gain stages (a small
+dedicated volume node per link), never the device's own volume. A link's
+effective volume is cell × link × cell. The hub's master Vol / Mute in
+the box header still uses `wpctl` on the virtual device itself.
+
+**Events** (right-click a cell → Add Event): *becomes Active* (audio
+flowing, debounced), *is Created*, *becomes Inactive*, *is Deleted*.
+**Select Outcome** greys out the box -- middle-click a cell once to
+block it, twice to unblock it (three times clears) -- then **Done**.
+The daemon runs events even with the window closed, and the blocks they
+set are saved (they survive reboots). Events don't fire for devices that
+already existed when the daemon started.
+
+**Show Unmanaged Links** also draws, dashed, the links Conduit didn't
+make (WirePlumber's, an app's own) that touch anything on the canvas,
+with dashed "ghost" cells for devices that aren't cells yet.
+Right-click a dashed link → **Add to Conduit** or **Block**; right-click
+a ghost cell → **Add as Cell**.
+
+Cell positions, zoom, divider sizes and the remembered devices live in
+`~/.config/conduit/layout.json`. The daemon never reads it, and moving
+things never restarts anything.
+
+### List editor
+
+The old Speaker / Microphone / Custom Conduit panels. Each shows only
+what's linked to that box's hub: **Input** (into the hub) and **Output**
+(out of it). A row stands for every link between that thing and the
+hub: its checkbox blocks / unblocks them, its spinbox sets their volume,
+**^** is the cell's Auto-Detect, and **✕** removes just those links (and
+the cell, if nothing else uses it). Anything the lists can't show --
+per-port choices, cell-to-cell and bypass links, anti-links, events,
+colours, positions, blocked cells -- is left exactly as it is.
+
+### Auto-Detect
+
+Per cell, unchanged from before -- for things like Discord/Vesktop that
+spin up a differently-named stream per screen share:
+
+- *Prefix match* -- "Chromium input-2" counts as a saved "Chromium input".
+- *Keyword match* -- anything whose name contains the text, e.g. "vencord".
+- *Same source app* -- every stream the same running app creates (only
+  while the cell's own device is live).
+- *Anti-Auto-Detect* -- comma-separated keywords that keep matches out
+  of the sweep (never the cell's own device).
+
+Matches are a routing-time decision only; they never get written back.
 
 ## Custom Conduits
 
-Below the Speaker and Microphone panels, **Custom Connection** lets
-you build your own virtual patch points — click **+** to add one.
-Each Custom Conduit gets:
+**+ Custom Conduit** (above the bottom row) adds your own virtual patch
+point. The box header has its **name** (click to rename), **As Speaker**
+/ **As Microphone**, noise suppression (with As Microphone), **Vol** /
+**Mute**, and **✕** to remove it (asks first). "As Microphone" adds a
+second device that taps the conduit's mix as a recording device -- the
+classic "Stereo Mix" pattern. Route anything into the conduit's hub and
+out of it to anything else, including another conduit or the Virtual
+Speaker.
 
-- **A name** — click it and type; it saves when you click away or hit
-  Enter.
-- **As Speaker** / **As Microphone** — independently checkable.
-  "As Speaker" doesn't need to do much: the conduit is already a
-  Sink-style device structurally (same as the main Virtual Speaker),
-  so it may appear as a selectable output regardless of this box —
-  there's no reliable cross-desktop way to hide a Sink-classed node
-  from speaker pickers. "As Microphone" is where it actually does
-  something: it creates a second, linked device that taps whatever
-  the conduit is carrying and exposes it as a recording device — the
-  classic "Stereo Mix" pattern (route game audio into the conduit, get
-  it back out both to real speakers *and* as a mic input for Discord).
-- **Its own Input and Output lists** — identical in every way to the
-  Speaker/Mic panels' lists (enable checkbox, volume multiplier,
-  Auto-Detect popup, all of it). Route anything into a conduit, then
-  out to anything else, including chaining one custom conduit into
-  another.
-- **Vol / Mute** — the conduit's own overall volume and mute, separate
-  from any per-entry volume in its Input/Output lists. Same free-text,
-  no-limit volume field as the Speaker/Mic panels (see below).
-- **✕ Remove** deletes the whole conduit and tears down its
-  connections.
-
-Unlike the two fixed virtual devices, Custom Conduits aren't part of
-your NixOS config — they're created and destroyed live by the daemon
-at runtime, so there's no rebuild step for adding, renaming, or
-removing one. The trade-off: if the daemon isn't running (crashed,
-mid-restart), a Custom Conduit's underlying device doesn't exist
-either. Renaming takes effect within a couple of seconds -- PipeWire
-doesn't support changing a live node's name in place, so under the
-hood this is a quick destroy-and-recreate with the new name; any
-connections through it get torn down and rebuilt automatically as
-part of that, the same brief interruption any other config change
-already causes.
+Custom Conduits are created live by the daemon (no rebuild): renaming is
+a quick destroy-and-recreate, and if the daemon isn't running the
+conduit's device doesn't exist either.
 
 ## Master Volume and Mute
 
-The Speaker and Microphone panels each have a **Vol** field and a
-**Mute** checkbox in their header — the device's overall volume,
-distinct from any per-entry volume multiplier inside their Input/
-Output/Bypass lists. Unlike those (a bounded 0.00x–10.00x spinner),
-this is a plain text field with no upper limit — type whatever
+Every box header has a **Vol** field and a **Mute** checkbox — the
+virtual device's own overall volume, distinct from cell and link
+volumes (inline gain stages, 0–10x). This one is a plain text field with no upper limit — type whatever
 multiplier you want. Volume of exactly `1.0` is left alone entirely
 (same "not managing this" convention as everywhere else); mute is
 always actively held either way, continuously re-applied every
@@ -265,9 +257,11 @@ all:
 services.conduit.noiseSuppression.enable = true;
 ```
 
-Rebuild, and the "Noise Suppression" button on the Microphone panel
-(and on any Custom Conduit with "As Microphone" ticked) becomes
-functional. Unlike the two main virtual devices, nothing is
+Rebuild, and the "Noise Suppression" button on the Microphone box
+(and on any Custom Conduit box with "As Microphone" ticked) becomes
+functional. On the canvas, picking a method splits the hub in two: the
+Virtual Mic on top, the processor below it, with a dashed connector
+between them. The processor's ports are linkable like any other cell. Unlike the two main virtual devices, nothing is
 statically declared beyond that one option — picking a method spawns
 a small dedicated PipeWire helper process for exactly that one thing,
 and switching back to None (or removing whatever was using it) kills
@@ -293,10 +287,10 @@ fully independent instance, even if two things pick the same method
 at once — never shared, since sharing would mean their audio gets
 mixed together *inside* the processor before either is denoised.
 
-For the Microphone panel specifically, turning this on doesn't just
-affect explicit **Output** entries — it also becomes what apps get
-when they simply select "Conduit Virtual Mic" as their default input
-device, so it doesn't matter which way an app reaches the mic.
+For the Microphone box specifically, turning this on moves every link
+that read from the Virtual Mic over to the processor (and back when you
+turn it off), and the processor's output becomes the default input
+device -- so it doesn't matter which way an app reaches the mic.
 
 ## Troubleshooting
 
@@ -371,76 +365,88 @@ systemctl --user restart conduit-daemon
 
 ## Config format
 
-`~/.config/conduit/state.json`, editable by hand if you'd rather skip
-the GUI — a `systemctl --user restart conduit-daemon` picks up
-changes:
+`~/.config/conduit/state.json`, schema version 2 (the full description
+is at the top of `conduit_core.py`):
 
 ```json
 {
-  "mic": {
-    "inputs": [
-      {
-        "label": "Blue Yeti Analog Stereo",
-        "enabled": true,
-        "volume": 1.0,
-        "mono": true,
-        "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}
-      }
-    ],
-    "outputs": [],
-    "noise_suppression": "rnnoise",
-    "volume": 1.0,
-    "muted": false
-  },
-  "speaker": {
-    "inputs": [],
-    "outputs": [
-      {"label": "Analog Stereo Speakers", "enabled": true, "volume": 1.0, "mono": false, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}},
-      {"label": "vencord-screen-share", "enabled": true, "volume": 1.0, "mono": false, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": true, "anti": true, "anti_keyword_text": "mic"}}
-    ],
-    "bypass": [
-      {"label": "Spotify", "enabled": true, "volume": 1.5, "mono": false, "auto_detect": {"prefix": false, "keyword": false, "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""}}
-    ],
-    "bypass_target": "Analog Stereo Speakers",
-    "volume": 1.0,
-    "muted": false
-  },
-  "custom": {
-    "next_id": 2,
-    "conduits": [
-      {
-        "id": 1,
-        "name": "Game Audio Mix",
-        "as_speaker": true,
-        "as_microphone": true,
-        "mic_noise_suppression": "webrtc",
-        "volume": 1.0,
-        "muted": false,
-        "inputs": [],
-        "outputs": []
-      }
-    ]
-  }
+  "version": 2,
+  "speaker": {"enabled": true, "volume": 1.0, "muted": false},
+  "mic": {"enabled": true, "volume": 1.0, "muted": false, "noise_suppression": "rnnoise"},
+  "custom": {"next_id": 2, "conduits": [
+    {"id": 1, "name": "Game Audio Mix", "enabled": true, "as_speaker": true,
+     "as_microphone": true, "mic_noise_suppression": "webrtc", "volume": 1.0, "muted": false}
+  ]},
+  "cells": [
+    {"id": "c1", "label": "spotify", "box": "speaker", "speaker": false, "volume": 1.0,
+     "blocked": false, "color": null, "auto_detect": {"prefix": false, "keyword": false,
+     "keyword_text": "", "same_app": false, "anti": false, "anti_keyword_text": ""},
+     "events": [{"kind": "active", "outcomes": {"c2": "block"}}]},
+    {"id": "c2", "label": "Analog Stereo Speakers", "box": "speaker", "speaker": true, "...": "..."}
+  ],
+  "links": [
+    {"id": "l1", "src": "c1", "src_port": "FL", "dst": "c2", "dst_port": "FL",
+     "volume": 1.5, "blocked": false, "color": null, "anti": false},
+    {"id": "l3", "src": "c1", "src_port": "*", "dst": "hub:speaker", "dst_port": "*",
+     "volume": 1.0, "blocked": true, "color": null, "anti": true}
+  ],
+  "next_cell_id": 3, "next_link_id": 4
 }
 ```
 
-Devices are matched by their `node.description` (stable across boots
-for the same hardware); apps are matched by `application.name`. Older
-configs from earlier Conduit versions (missing `enabled`/`volume`/
-`mono`, a flat list of strings, or a short-lived list-wide auto-detect
-format) are migrated automatically on next load -- no manual edits
-needed.
-There's also a small internal `~/.config/conduit/.link_cache.json` the
-daemon uses to track what it last connected across restarts, so it can
-undo stale links when you remove or disable something -- not meant to
-be hand-edited, safe to delete if it's ever in a confusing state (the
-daemon just starts fresh with an empty one).
+- Hubs aren't cells; links name them as `hub:speaker`, `hub:mic`,
+  `hub:custom.<id>`, `hub:custom.<id>.mic`, and the processors
+  `ns:mic` / `ns:custom.<id>`.
+- Ports are PipeWire channel names (`FL`, `FR`, `MONO`, ...). `*` means
+  every port; it's what anti-links use.
+- A blocked link is an anti-link: that pair is never linked, whoever
+  makes it. A blocked cell is silent.
+
+**Migration.** The first time the new daemon or GUI sees an old config,
+it copies it to `state.v1.backup.json` and converts it: every list entry
+becomes a cell with explicit L→L / R→R links (Mono entries: every port
+to every port -- the Mono checkbox is gone, per-port links cover it);
+`enabled: false` entries become blocked links; Bypass entries become
+direct links to the Destination, which becomes a speaker cell, plus the
+default anti-link; entry volumes move to their links. To go back, stop
+the daemon and copy the backup over `state.json`.
+
+`.link_cache.json` (what the daemon managed last cycle, so removing a
+link undoes it once even across the restart) is unchanged and still safe
+to delete.
 
 ## Repo layout
 
 ```
-flake.nix          -- nixosModules.default + a standalone `conduit` package/app
-module.nix         -- services.conduit option, virtual device config, systemd service
-conduit_daemon.py  -- background router, polls PipeWire every 2s and reconciles links
-conduit_gui.py      -- PySide6 editor for state.json
+flake.nix              nixosModules.default + the conduit package / app
+module.nix             services.conduit options, virtual devices, the daemon's user service
+package.nix            the package (scripts, vendored qt_ui_kit, icons, wrapper)
+conduit_core.py        state schema + migration, PipeWire parsing, the link plan (shared)
+conduit_daemon.py      the router: polls PipeWire every 2 s and reconciles; runs events
+conduit_gui.py         window, Graphical | List switch, toolbar, tray, CLI flags
+conduit_controller.py  the GUI's model: edits, auto-apply / save, live refresh
+conduit_graph.py       the node canvas
+conduit_list.py        the list editor
+conduit_header.py      a box's header (shared by both editors)
+conduit_dialogs.py     auto-detect, noise suppression, volume, colour, New Cell, events
+conduit_layout.py      layout.json (positions, zoom, dividers, remembered devices)
+qt_ui_kit/             vendored theming / widget kit (read its UI_THEMING_GUIDE.md)
+assets/conduit_logo.png
+tests/                 fake PipeWire + daemon, GUI, menu and screenshot tests
 ```
+
+## Tests
+
+No real PipeWire needed -- `tests/fake_pw.py` emulates `pw-dump`,
+`pw-link`, `pw-cli` and `wpctl`:
+
+```fish
+cd conduit
+python3 tests/test_core_daemon.py                                   # model, migration, daemon
+QT_QPA_PLATFORM=offscreen python3 tests/test_gui.py                 # real mouse events on the canvas / lists
+QT_QPA_PLATFORM=offscreen python3 tests/test_menus.py               # every context-menu action
+QT_QPA_PLATFORM=offscreen python3 tests/render_screens.py /tmp/shots  # screenshots
+```
+
+(They need Python 3.11+ with PySide6, e.g.
+`nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (p: [p.pyside6])'`.)

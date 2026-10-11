@@ -1,5 +1,5 @@
 {
-  description = "Conduit -- PipeWire virtual mic/speaker router + Qt editor for NixOS";
+  description = "Conduit -- PipeWire virtual mic/speaker router + node-graph editor for NixOS";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -11,48 +11,17 @@
       pkgs = import nixpkgs { inherit system; };
     in
     {
-      # Add this to your own flake's inputs, then:
+      # In your own flake:
       #   imports = [ inputs.conduit.nixosModules.default ];
       #   services.conduit = { enable = true; user = "yourusername"; };
       nixosModules.default = import ./module.nix;
 
-      # Lets you build/run the GUI directly without the full module,
-      # e.g. `nix run github:mr-tinkle-winkle/conduit` -- handy for a
-      # quick look. Note this standalone path won't have the virtual
-      # devices or the daemon service the module sets up, so there's
-      # nothing to actually route until the module is installed too.
+      # `nix run github:mr-tinkle-winkle/conduit` opens the GUI for a quick look.
+      # Without the module there are no virtual devices and no daemon, so
+      # nothing actually routes.
       packages.${system} = {
         default = self.packages.${system}.conduit;
-
-        conduit = pkgs.stdenv.mkDerivation {
-          pname = "conduit";
-          version = "1.0";
-          dontUnpack = true;
-          nativeBuildInputs = [ pkgs.makeWrapper pkgs.imagemagick ];
-          installPhase =
-            let
-              guiPython = pkgs.python3.withPackages (ps: [ ps.pyside6 ]);
-              qtPluginPath = "${pkgs.qt6.qtbase}/lib/qt-6/plugins";
-              iconSizes = [ 16 24 32 48 64 128 256 ];
-            in
-            ''
-              mkdir -p $out/bin $out/share/conduit
-              cp ${./conduit_daemon.py} $out/share/conduit/conduit_daemon.py
-              cp ${./conduit_gui.py} $out/share/conduit/conduit_gui.py
-              makeWrapper ${guiPython}/bin/python3 $out/bin/conduit \
-                --set PYTHONPATH $out/share/conduit \
-                --add-flags $out/share/conduit/conduit_gui.py \
-                --set QT_PLUGIN_PATH "${qtPluginPath}" \
-                --set QT_QPA_PLATFORM_PLUGIN_PATH "${qtPluginPath}/platforms" \
-                --prefix PATH : "${pkgs.pipewire}/bin:${pkgs.wireplumber}/bin"
-
-              ${pkgs.lib.concatMapStringsSep "\n" (sz: ''
-                mkdir -p $out/share/icons/hicolor/${toString sz}x${toString sz}/apps
-                convert ${./assets/conduit_logo.png} -resize ${toString sz}x${toString sz} \
-                  $out/share/icons/hicolor/${toString sz}x${toString sz}/apps/conduit.png
-              '') iconSizes}
-            '';
-        };
+        conduit = pkgs.callPackage ./package.nix { };
       };
 
       apps.${system}.default = {

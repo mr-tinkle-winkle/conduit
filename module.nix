@@ -22,59 +22,18 @@
 let
   cfg = config.services.conduit;
 
-  # The daemon only needs the stdlib (json/subprocess/pathlib) -- it
-  # shells out to pw-dump/pw-link/wpctl rather than binding to
-  # PipeWire directly, so no extra Python packages are required.
+  # The daemon only needs the stdlib (it shells out to pw-dump / pw-link /
+  # wpctl / pw-cli), so a bare python3 runs it; the GUI's PySide6 lives in the
+  # package's own wrapper (package.nix).
   daemonPython = pkgs.python3;
-
-  # The GUI additionally needs PySide6 to talk to Qt.
-  guiPython = pkgs.python3.withPackages (ps: [ ps.pyside6 ]);
-
-  # PySide6 ships with `dontWrapQtApps = true` (it's a library, not an
-  # app) -- nothing auto-sets the Qt platform plugin path the way
-  # wrapQtAppsHook would for a compiled Qt binary. Since we're wrapping
-  # a bare python3 interpreter + script (not something wrapQtAppsHook
-  # can detect and patch), these have to be set by hand or every
-  # launch fails with "could not find the Qt platform plugin xcb/wayland".
-  qtPluginPath = "${pkgs.qt6.qtbase}/lib/qt-6/plugins";
-
-  # Icon lookup by name (as used in the .desktop entry below) walks
-  # share/icons/hicolor/<size>/apps/<name>.<ext> under each
-  # XDG_DATA_DIRS entry, so it has to be installed at exactly this
-  # path layout to be found by launchers/taskbars at all. Resized at
-  # build time with ImageMagick from the single source logo rather
-  # than committing a pile of pre-scaled duplicates to the repo --
-  # same approach as Puppetry.
-  conduitIconSizes = [ 16 24 32 48 64 128 256 ];
-
-  conduitGui = pkgs.stdenv.mkDerivation {
-    pname = "conduit";
-    version = "1.0";
-    dontUnpack = true;
-    nativeBuildInputs = [ pkgs.makeWrapper pkgs.imagemagick ];
-    installPhase = ''
-      mkdir -p $out/bin
-      makeWrapper ${guiPython}/bin/python3 $out/bin/conduit \
-        --set PYTHONPATH /etc/conduit \
-        --add-flags /etc/conduit/conduit_gui.py \
-        --set QT_PLUGIN_PATH "${qtPluginPath}" \
-        --set QT_QPA_PLATFORM_PLUGIN_PATH "${qtPluginPath}/platforms" \
-        --prefix PATH : "${pkgs.pipewire}/bin:${pkgs.wireplumber}/bin"
-
-      ${lib.concatMapStringsSep "\n" (sz: ''
-        mkdir -p $out/share/icons/hicolor/${toString sz}x${toString sz}/apps
-        convert ${./assets/conduit_logo.png} -resize ${toString sz}x${toString sz} \
-          $out/share/icons/hicolor/${toString sz}x${toString sz}/apps/conduit.png
-      '') conduitIconSizes}
-    '';
-  };
+  conduitPkg = pkgs.callPackage ./package.nix { };
 
   conduitDesktopItem = pkgs.makeDesktopItem {
     name = "conduit";
     exec = "conduit";
     icon = "conduit";
     desktopName = "Conduit";
-    comment = "Configure the virtual mic/speaker router";
+    comment = "Route apps, mics and speakers through PipeWire";
     categories = [ "AudioVideo" "Audio" ];
   };
 
@@ -187,18 +146,13 @@ in
     # suppression has nothing statically present -- see
     # conduit_daemon.py's NOISE SUPPRESSION section.
 
-    # Ship both scripts declaratively, same as Puppetry -- the GUI
-    # imports the daemon module at runtime, so both need to land
-    # together. `nixos-rebuild switch` is the only thing that updates
-    # them; state.json (~/.config/conduit/state.json) is separate and
-    # untouched by rebuilds.
-    environment.etc = {
-      "conduit/conduit_daemon.py".source = ./conduit_daemon.py;
-      "conduit/conduit_gui.py".source = ./conduit_gui.py;
-    };
+    # Everything runs from the package's store path (so a rebuild can't leave
+    # a stale copy behind); /etc/conduit is only a convenience symlink to it.
+    # state.json / layout.json in ~/.config/conduit are untouched by rebuilds.
+    environment.etc."conduit".source = "${conduitPkg}/share/conduit";
 
     environment.systemPackages = [
-      conduitGui
+      conduitPkg
       conduitDesktopItem
       pkgs.pipewire   # pw-dump / pw-link on PATH for manual debugging
       pkgs.wireplumber # wpctl likewise
@@ -224,12 +178,13 @@ in
       wantedBy = [ "default.target" ];
       path = [ pkgs.pipewire pkgs.wireplumber ];
       serviceConfig = {
-        ExecStart = "${daemonPython}/bin/python3 /etc/conduit/conduit_daemon.py";
+        ExecStart = "${daemonPython}/bin/python3 ${conduitPkg}/share/conduit/conduit_daemon.py";
         Restart = "on-failure";
         RestartSec = 2;
         KillMode = "control-group";
         Environment = [
           "PYTHONUNBUFFERED=1"
+          "PYTHONDONTWRITEBYTECODE=1"
         ] ++ lib.optional cfg.noiseSuppression.enable
           "CONDUIT_RNNOISE_LADSPA_PATH=${rnnoiseLadspaPath}";
       };
