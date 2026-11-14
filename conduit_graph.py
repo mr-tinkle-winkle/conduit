@@ -86,6 +86,10 @@ class CellItem(QGraphicsObject):
         self.setAcceptHoverEvents(True)
         self.setZValue(2)
         self.setCursor(Qt.ArrowCursor)
+        # Painted once into a device pixmap and blitted after that: dragging, scrolling and the
+        # repaints of other items no longer re-run the theme's painting.  Anything that changes the
+        # look calls update() (configure, hover, _repaint for animation frames and selection).
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
 
     # -- data
     def configure(self, title, ins, outs, status, volume_text="", color=None, also="", speaker=False,
@@ -220,6 +224,7 @@ class CellItem(QGraphicsObject):
 
     def mouseReleaseEvent(self, e):
         self.editor.interacting = False
+        self.editor.end_cell_drag()
         if self._drag_link:
             self._drag_link = False
             self.editor.end_link_drag(e.screenPos())
@@ -245,12 +250,21 @@ class LinkItem(QGraphicsItem):
         super().__init__()
         self.editor, self.key, self.ghost, self.internal = editor, key, ghost, internal
         self.path = QPainterPath()
+        self.ends_at = (QPointF(), QPointF())
         self.setZValue(0)
         self.setAcceptedMouseButtons(Qt.NoButton if internal else (Qt.LeftButton | Qt.MiddleButton | Qt.RightButton))
 
-    def set_points(self, p1, p2):
+    CACHE_MAX_AREA = 900_000         # scene px^2; bigger links paint directly (pixmap memory)
+
+    def set_points(self, p1, p2, moving=False):
         self.prepareGeometryChange()
+        self.ends_at = (QPointF(p1), QPointF(p2))
         self.path = link_path(p1, p2, self.key)
+        r = self.boundingRect()
+        cache = not moving and r.width() * r.height() <= self.CACHE_MAX_AREA
+        want = QGraphicsItem.DeviceCoordinateCache if cache else QGraphicsItem.NoCache
+        if self.cacheMode() != want:
+            self.setCacheMode(want)
 
     def boundingRect(self):
         return self.path.boundingRect().adjusted(-70, -110, 70, 110)
@@ -303,7 +317,15 @@ class BoxView(QGraphicsView):
         self.setFrameShape(QGraphicsView.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # The theme's background is rendered once per scroll position / zoom and reused; animated
+        # backgrounds (Frosted Glass, Arcade) are refreshed a few times a second by the editor.
+        self.setCacheMode(QGraphicsView.CacheBackground)
+        self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, True)
         self.zoom = 1.0
+        self._zoom_target = None
+        self._zoom_anim = QTimer(self)
+        self._zoom_anim.setInterval(12)
+        self._zoom_anim.timeout.connect(self._zoom_step)
         self._band = None
         self._band_origin = None
         self._pan_last = None
@@ -315,6 +337,7 @@ class BoxView(QGraphicsView):
         self._view_save.setInterval(400)
         self._view_save.timeout.connect(self._save_view)
         self.scene_.setSceneRect(QRectF(-3000, -3000, 6000, 6000))
+        self.scene_.setItemIndexMethod(QGraphicsScene.NoIndex)
         self.horizontalScrollBar().valueChanged.connect(self._scrolled)
         self.verticalScrollBar().valueChanged.connect(self._scrolled)
 
@@ -344,10 +367,33 @@ class BoxView(QGraphicsView):
         z = max(0.25, min(3.0, z))
         self.setTransform(self.transform().fromScale(z, z))
         self.zoom = z
+        self.resetCachedContent()             # the background's line widths follow the zoom
         self.editor.overlay.update()
         self._view_save.start()
 
+    def _zoom_step(self):
+        """Ease towards the wheel's target zoom (anchored under the mouse) instead of jumping."""
+        t = self._zoom_target
+        if t is None:
+            self._zoom_anim.stop()
+            return
+        z = self.zoom + (t - self.zoom) * 0.35
+        if abs(t - z) < 0.004 * t:
+            z, self._zoom_target = t, None
+            self._zoom_anim.stop()
+        self.set_zoom(z)
+
+    def refresh(self, background=False):
+        """Repaint: every item re-renders its cached pixmap (animation frame, selection, sync)."""
+        if background:
+            self.resetCachedContent()
+        for it in self.scene_.items():
+            it.update()
+        self.viewport().update()
+
     def fit(self):
+        self._zoom_target = None
+        self._zoom_anim.stop()
         items = [i for i in self.cells.values()]
         if not items:
             self.set_zoom(1.0)
@@ -385,7 +431,15 @@ class BoxView(QGraphicsView):
         dy = e.angleDelta().y()
         if dy == 0:
             return
-        self.set_zoom(self.zoom * (1.15 ** (dy / 120.0)))
+        base = self._zoom_target if self._zoom_target is not None else self.zoom
+        target = max(0.25, min(3.0, base * (1.15 ** (dy / 120.0))))
+        if getattr(self.editor, "animations", True) and self.isVisible():
+            self._zoom_target = target
+            if not self._zoom_anim.isActive():
+                self._zoom_anim.start()
+            self._zoom_step()
+        else:
+            self.set_zoom(target)
         e.accept()
 
     def mousePressEvent(self, e):
@@ -544,7 +598,9 @@ class Overlay(QWidget):
             clip.addRect(QRectF(QRect(vp.mapTo(self.editor, QPoint(0, 0)), vp.size())))
         p.setClipPath(clip)
         sk = SK()
+        painted = QRectF()
         for key, path, kind in self.editor.cross_paths():
+            painted = painted.united(path.boundingRect())
             if kind == "ghost":
                 sk.paint_link(p, path, _alpha(sk.col("fg"), 110), LinkLook(key, dashed=True, kind="ghost"))
             else:
@@ -557,6 +613,8 @@ class Overlay(QWidget):
             end = QPointF(self.editor.mapFromGlobal(d["cursor"]))
             path = link_path(start, end, "drag") if d["side"] == "out" else link_path(end, start, "drag")
             sk.paint_link(p, path, _alpha(sk.col("fg"), 220), LinkLook("drag", dashed=True, kind="drag"))
+            painted = painted.united(path.boundingRect())
+        self.editor._overlay_rect = painted
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +638,9 @@ class GraphEditor(QWidget):
         self._any_signal = False
         self._tick_n = 0
         self._paint_cost = 0.0           # seconds spent painting since the last tick
+        self._bg_at = 0.0                # last refresh of an animated background
+        self._moving_links: set = set()  # links following a dragged cell (painted uncached)
+        self._overlay_rect = QRectF()    # what the overlay painted last (for partial updates)
         self._anim = QTimer(self)
         self._anim.setInterval(40)
         self._anim.timeout.connect(self._tick)
@@ -696,10 +757,22 @@ class GraphEditor(QWidget):
             now = time.monotonic()
             for k in [k for k, t in self._fx.items() if now - t > 4.0]:
                 del self._fx[k]
+        now = time.monotonic()
+        bg = sk.bg_animated and now - self._bg_at > 0.25
+        if bg:
+            self._bg_at = now
+        # while a cell / link / view is being dragged the pointer drives the frames; ambient
+        # animation only refreshes every third tick so the drag keeps the frame budget
+        busy = self.interacting or self.drag is not None
         if self._fx or (sk.animated and self._any_signal):
-            self._repaint()                       # full rate while something is moving
+            if not busy or self._tick_n % 3 == 0:
+                self._repaint(bg)                 # full rate while something is moving
         elif sk.animated and self._tick_n % 6 == 0:
-            self._repaint()                       # ~5 fps for blinks and ambient drift
+            self._repaint(bg)                     # ~5 fps for blinks and ambient drift
+        elif bg:
+            for bw in self.visible_box_widgets():
+                bw.view.resetCachedContent()
+                bw.view.viewport().update()
 
     def plain_box_label(self, box) -> str:
         return core.box_label(self.c.state, box)
@@ -826,7 +899,7 @@ class GraphEditor(QWidget):
         self._sync_signals()
         self.selected &= {l["id"] for l in st["links"]}
         for bw in self.box_widgets.values():
-            bw.view.viewport().update()
+            bw.view.refresh(background=True)
         self.overlay.update()
 
     def _sync_signals(self):
@@ -1118,9 +1191,9 @@ class GraphEditor(QWidget):
                 y = max(y, other.pos().y() + other.height() + 24)
         it.setPos(x, y)
 
-    def cross_paths(self):
+    def cross_paths(self, entries=None):
         out = []
-        for key, a, sch, b, dch, kind in self._cross:
+        for key, a, sch, b, dch, kind in (self._cross if entries is None else entries):
             if not (a.scene() and b.scene()):
                 continue
             pa = self._to_editor(a, a.port_scene_pos("out", sch))
@@ -1202,12 +1275,30 @@ class GraphEditor(QWidget):
     # ------------------------------------------------------------ moving
     def cell_moved(self, it: CellItem):
         view = self.box_widgets[it.box].view if it.box in self.box_widgets else None
+        moving = self.interacting
         if view is not None:
             for li in view.links.values():
                 ends = getattr(li, "ends", None)
                 if ends and (ends[0] is it or ends[2] is it or ends[0].parentItem() is it or ends[2].parentItem() is it):
-                    li.set_points(ends[0].port_scene_pos("out", ends[1]), ends[2].port_scene_pos("in", ends[3]))
-        self.overlay.update()
+                    li.set_points(ends[0].port_scene_pos("out", ends[1]), ends[2].port_scene_pos("in", ends[3]),
+                                  moving=moving)
+                    if moving:
+                        self._moving_links.add(li)
+        mine = [e for e in self._cross if it in (e[1], e[3]) or it.parentItem() in (e[1], e[3])]
+        if not moving:
+            self.overlay.update()
+        elif mine:
+            new = QRectF()
+            for key, path, kind in self.cross_paths(mine):
+                new = new.united(path.boundingRect())
+            self.update_overlay_around(new)
+
+    def end_cell_drag(self):
+        """Links that followed a dragged cell go back to being cached."""
+        links, self._moving_links = self._moving_links, set()
+        for li in links:
+            if li.scene() is not None:
+                li.set_points(*li.ends_at)
 
     def cell_released(self, it: CellItem, global_pos):
         target = self.view_at(global_pos)
@@ -1245,7 +1336,9 @@ class GraphEditor(QWidget):
     def update_link_drag(self, global_pos):
         if self.drag is not None:
             self.drag["cursor"] = global_pos
-            self.overlay.update()
+            start = self.drag["start_pos"]()
+            end = QPointF(self.mapFromGlobal(global_pos))
+            self.update_overlay_around(QRectF(start, end).normalized())
 
     def end_link_drag(self, global_pos):
         d, self.drag = self.drag, None
@@ -1313,10 +1406,17 @@ class GraphEditor(QWidget):
         self.selected = (self.selected | found) if additive else found
         self._repaint()
 
-    def _repaint(self):
+    def _repaint(self, background=False):
         for bw in self.box_widgets.values():
-            bw.view.viewport().update()
+            if bw.isVisible():
+                bw.view.refresh(background)
         self.overlay.update()
+
+    def update_overlay_around(self, rect: QRectF):
+        """Repaint only the part of the overlay that changed: what it drew last time plus `rect`."""
+        r = self._overlay_rect.united(rect) if not self._overlay_rect.isNull() else rect
+        if not r.isNull():
+            self.overlay.update(r.adjusted(-130, -130, 130, 130).toAlignedRect())
 
     def delete_selected(self):
         if self.selected:

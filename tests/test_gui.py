@@ -143,6 +143,21 @@ before = view("speaker").zoom, view("mic").zoom
 view("speaker").set_zoom(view("speaker").zoom * 1.5)
 check(view("mic").zoom == before[1] and view("speaker").zoom != before[0], "zoom is per box")
 
+# 9b. the wheel eases into the new zoom; drawing is cached
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsView
+sv = view("speaker"); z0 = sv.zoom
+vp = sv.viewport(); c0 = QPointF(vp.width() / 2, vp.height() / 2)
+QApplication.sendEvent(vp, QWheelEvent(c0, QPointF(vp.mapToGlobal(c0.toPoint())), QPoint(0, 0), QPoint(0, 120),
+                                       Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False))
+mid = sv.zoom
+QTest.qWait(400)
+check(z0 < mid < z0 * 1.15 - 1e-6 and abs(sv.zoom - z0 * 1.15) < 1e-6, f"wheel zoom eases in ({z0:.3f} -> {mid:.3f} -> {sv.zoom:.3f})")
+cells = [x for x in sv.cells.values() if not x.ghost]
+check(all(x.cacheMode() == QGraphicsItem.DeviceCoordinateCache for x in cells) and
+      sv.cacheMode() == QGraphicsView.CacheBackground, "cells and background are cached")
+linked = lambda x, l: getattr(l, "ends", None) is not None and (l.ends[0] is x or l.ends[2] is x)
+
 # 10. fullscreen
 g.toggle_fullscreen("custom.1"); QTest.qWait(50)
 check(not g.box_widgets["speaker"].isVisible() and g.box_widgets["custom.1"].isVisible(), "fullscreen hides other boxes")

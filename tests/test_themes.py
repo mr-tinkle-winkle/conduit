@@ -82,6 +82,22 @@ for key in [k for k in skins.ORDER if skins.SKINS[k].light]:
 w = w.set_theme("rack", dark=True); QTest.qWait(60)
 check(skins.current().key == "rack" and not skins.current().dark, "dark mode is ignored by themes that are already dark")
 w = w.set_theme("studio", dark=False); QTest.qWait(60)
+from PySide6.QtWidgets import QGraphicsItem
+# links that follow a dragged cell paint live, then go back to cached
+from PySide6.QtCore import QPointF as _P
+g = w.graph
+linked = lambda x, l: getattr(l, "ends", None) is not None and (l.ends[0] is x or l.ends[2] is x)
+sv, mover = next((bw.view, x) for bw in g.box_widgets.values() for x in bw.view.cells.values()
+                 if any(linked(x, l) for l in bw.view.links.values()))
+g.interacting = True
+mover.setPos(mover.pos() + _P(5, 5)); QTest.qWait(20)
+follow = [l for l in sv.links.values() if linked(mover, l)]
+check(follow and all(l.cacheMode() == QGraphicsItem.NoCache for l in follow), "links following a dragged cell paint live")
+g.interacting = False; g.end_cell_drag()
+mover.setPos(mover.pos() - _P(5, 5)); QTest.qWait(20)
+check(all(l.cacheMode() == QGraphicsItem.DeviceCoordinateCache or l.boundingRect().width() * l.boundingRect().height() > l.CACHE_MAX_AREA
+          for l in follow), "and are cached again after the drag")
+
 # every bundled weight is a real face (variable fonts only exposed one weight to Qt)
 from PySide6.QtGui import QFontInfo
 from conduit_skin_base import F

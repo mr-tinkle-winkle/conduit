@@ -140,7 +140,9 @@ live); it is activity, not a level measurement. The **Animations**
 switch in the Theme menu turns all motion off. While something is
 animating the canvas repaints at up to 25 fps and backs off by itself
 when painting gets expensive; idle themes only repaint a few times a
-second for blinks. Keys in every theme: **F2** new cell, **F5** refresh
+second for blinks. Cells, links and the background are drawn once and reused, so
+dragging cells, drawing links and scrolling only repaint what moved; the
+mouse wheel eases into each zoom step (`tests/bench_drag.py` measures it). Keys in every theme: **F2** new cell, **F5** refresh
 devices, **F9** block / unblock the selected links, **Del** delete them.
 
 The three light themes (Transit Map, Swiss Poster, Notebook) have a dark

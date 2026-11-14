@@ -239,6 +239,7 @@ class Skin:
     name = "Studio"
     blurb = "Pure black and white, coloured cables. No motion."
     animated = False             # needs frames while audio is flowing
+    bg_animated = False          # paint_background changes over time (refreshed ~4x a second)
     anchor_inset = 0.0           # how far inside the port's outer edge links attach
     ui_font = None               # (family, point size) for the app's widgets; None = desktop default
     title_font = None            # QFont for box titles; None = bold UI font

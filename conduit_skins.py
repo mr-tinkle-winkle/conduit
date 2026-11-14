@@ -922,6 +922,7 @@ class TuiSkin(Skin):
 class GlassSkin(Skin):
     key, name = "glass", "Liquid Glass"
     blurb = "Frosted cards over a drifting aurora; springy and soft."
+    bg_animated = True
     animated = True
     ui_font = ("Manrope", 10, 500)
     style_args = dict(window="#0c1316", base="#101a1e", surface="#1a272c", accent="#26373d", secondary="#14b8a6",
@@ -1587,6 +1588,7 @@ class SketchSkin(Skin):
 class ArcadeSkin(Skin):
     key, name = "arcade", "Arcade"
     blurb = "8-bit cabinet: pixel sprites, a score HUD, chase-light links."
+    bg_animated = True
     animated = True
     ui_font = ("Share Tech Mono", 10)
     style_args = dict(window="#070712", base="#0b0b1c", surface="#11112a", accent="#1c1c40", secondary="#ff3df0",
