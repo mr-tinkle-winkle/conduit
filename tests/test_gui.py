@@ -17,7 +17,7 @@ d = Path(tempfile.mkdtemp())
 core.CONFIG_DIR = d; core.STATE_FILE = d / "state.json"; core.LAYOUT_FILE = d / "layout.json"
 core.LINK_CACHE_FILE = d / ".link_cache.json"; core.V1_BACKUP_FILE = d / "state.v1.backup.json"
 RESTARTS = []
-core.restart_daemon = lambda: RESTARTS.append(1)
+core.notify_daemon = lambda: RESTARTS.append(1)
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
@@ -80,7 +80,7 @@ links = [l for l in c.state["links"] if l["src"] == spotify["id"] and l["dst"] =
 check(sorted((l["src_port"], l["dst_port"]) for l in links) == [("FL", "FL"), ("FR", "FR")], "Both drag makes L+R links")
 check(json.loads(core.STATE_FILE.read_text())["links"], "auto-apply wrote state.json")
 QTest.qWait(700)
-check(RESTARTS, "auto-apply restarted the daemon (debounced)")
+check(RESTARTS, "auto-apply notified the daemon (debounced)")
 
 # 2. single port: spotify L -> ryzen R (bypass) -> anti-link created
 drag("speaker", port_global("speaker", spotify["id"], "out", "FL"), port_global("speaker", ryzen["id"], "in", "FR"))

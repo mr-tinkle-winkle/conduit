@@ -11,7 +11,7 @@ from fake_pw import standard_graph, V1_README_STATE
 d = Path(tempfile.mkdtemp())
 core.CONFIG_DIR = d; core.STATE_FILE = d / "state.json"; core.LAYOUT_FILE = d / "layout.json"
 core.LINK_CACHE_FILE = d / ".link_cache.json"; core.V1_BACKUP_FILE = d / "state.v1.backup.json"
-core.restart_daemon = lambda: None
+core.notify_daemon = lambda: None
 core.STATE_FILE.write_text(json.dumps(V1_README_STATE))
 
 ERRORS = []

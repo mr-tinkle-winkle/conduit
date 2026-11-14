@@ -1,0 +1,5 @@
+All fonts in this folder are licensed under the SIL Open Font License 1.1
+(https://openfontlicense.org) and were taken unmodified from github.com/google/fonts.
+Archivo, Archivo Black (Omnibus-Type) - Barlow Condensed (Jeremy Tribby) - Caveat (Impallari Type)
+IBM Plex Mono (IBM) - JetBrains Mono (JetBrains) - Manrope (Mikhail Sharanda) - Oswald (Vernon Adams)
+Overpass (Delve Withrington / Red Hat) - Press Start 2P (CodeMan38) - Share Tech Mono (Carrois) - VT323 (Peter Hull)

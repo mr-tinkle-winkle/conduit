@@ -13,6 +13,7 @@ import qt_ui_kit as kit
 
 import conduit_core as core
 import conduit_dialogs as dlg
+import conduit_skins as skins
 
 
 class BoxHeader(QWidget):
@@ -34,7 +35,18 @@ class BoxHeader(QWidget):
         if self.is_custom:
             outer.addLayout(h)
 
+        sk = skins.current()
+        index = core.all_boxes(controller.state).index(box) if box in core.all_boxes(controller.state) else 0
+        self._index = index
         if self.is_custom:
+            prefix = sk.box_title("\x00", index).split("\x00")[0].strip()
+            if prefix:
+                pl = QLabel(prefix)
+                if sk.title_font is not None:
+                    pl.setFont(sk.title_font)
+                else:
+                    pl.setStyleSheet("QLabel { font-weight: bold; font-size: 14px; }")
+                row1.addWidget(pl)
             self.name = kit.CustomLineEdit("")
             self.name.setToolTip("Click to rename")
             self.name.setMinimumWidth(110)
@@ -55,8 +67,11 @@ class BoxHeader(QWidget):
             h.addWidget(self.as_mic)
             h.addStretch(1)
         else:
-            self.name = QLabel(core.box_label(controller.state, box))
-            self.name.setStyleSheet("QLabel { font-weight: bold; font-size: 14px; }")
+            self.name = QLabel(sk.box_title(core.box_label(controller.state, box), index))
+            if sk.title_font is not None:
+                self.name.setFont(sk.title_font)
+            else:
+                self.name.setStyleSheet("QLabel { font-weight: bold; font-size: 14px; }")
             h.addWidget(self.name)
             h.addStretch(1)
 
@@ -67,6 +82,11 @@ class BoxHeader(QWidget):
         self.ns.clicked.connect(self._ns_menu)
         self.ns.setVisible(box != "speaker")
         h.addWidget(self.ns)
+
+        self.eq = kit.CustomButton("EQ")
+        self.eq.setToolTip("Equaliser for this device: a response graph with draggable bands and a live spectrum")
+        self.eq.clicked.connect(self._open_eq)
+        h.addWidget(self.eq)
 
         h.addWidget(QLabel("Vol"))
         self.vol = kit.CustomLineEdit("1.0")
@@ -117,9 +137,14 @@ class BoxHeader(QWidget):
         self.ns.setToolTip("Noise suppression for this microphone" if is_mic
                            else "Only while this box acts as a microphone (As Microphone)")
         self.ns.setText(dlg.noise_suppression_button_text(core.ns_method(self.c.state, self.box)))
+        self.eq.setText("EQ ●" if core.eq_enabled(self.c.state, self.box) else "EQ")
         self.state_label.setText("" if core.box_enabled(self.c.state, self.box) else "disabled")
         for w in (self.vol, self.mute, self.ns) + ((self.as_speaker, self.as_mic) if self.is_custom else ()):
             w.blockSignals(False)
+
+    def _open_eq(self):
+        import conduit_eqview
+        conduit_eqview.open_eq(self.window(), self.c, self.box)
 
     def _rename(self):
         hub = self._hub()

@@ -34,74 +34,24 @@ from PySide6.QtWidgets import (QApplication, QGraphicsItem, QGraphicsObject, QGr
 import qt_ui_kit as kit
 
 import conduit_core as core
+import time
+
 import conduit_dialogs as dlg
 from conduit_header import BoxHeader
 
-# ---------------------------------------------------------------------------
-# look
-# ---------------------------------------------------------------------------
-
-COLOR_IN = QColor("#3b82f6")        # into a virtual device
-COLOR_OUT = QColor("#f97316")       # out of a virtual device
-COLOR_BYPASS = QColor("#22c55e")    # app straight to a real speaker
-COLOR_DIRECT = QColor("#facc15")    # any other cell-to-cell link
-COLOR_PENDING = QColor("#6e6e6e")   # configured, not linked in PipeWire (yet)
-COLOR_BLOCKED = QColor("#6b1010")   # very dark red
-COLOR_CLOSED = QColor("#a855f7")    # purple
-COLOR_GHOST = QColor(255, 255, 255, 110)
-COLOR_INTERNAL = QColor(255, 255, 255, 90)
-
-CELL_W = 196
-HEADER_H = 26
-ROW_H = 20
-PORT_W = 46
-PORT_H = 16
-BOTH_EXTRA = 38      # how far the Both pill reaches past L / R, into the cell
-BOTTOM_PAD = 8
-NS_GAP = 34
-LINK_W = 2.2
+import conduit_skins as skins
+from conduit_skin_base import (BOTH_EXTRA, BOTTOM_PAD, CELL_W, HEADER_H, NS_GAP, PORT_H, PORT_W, ROW_H,  # noqa: F401
+                               LinkLook, port_label)
+from conduit_skin_base import alpha as _alpha
 
 
-def port_label(ch: str) -> str:
-    return {"*": "Both", "FL": "L", "FR": "R", "MONO": "M"}.get(ch, ch)
+def SK():
+    """The current skin (theme) -- everything on the canvas is drawn by it."""
+    return skins.current()
 
 
-def link_path(p1: QPointF, p2: QPointF) -> QPainterPath:
-    path = QPainterPath(p1)
-    dx = max(40.0, abs(p2.x() - p1.x()) * 0.5)
-    path.cubicTo(QPointF(p1.x() + dx, p1.y()), QPointF(p2.x() - dx, p2.y()), p2)
-    return path
-
-
-def paint_link(p: QPainter, path: QPainterPath, color: QColor, *, selected=False, dashed=False,
-               label: str = "", width: float = LINK_W, bg: QColor | None = None):
-    p.setRenderHint(QPainter.Antialiasing)
-    if selected:
-        glow = QPen(QColor(255, 255, 255, 200), width + 4)
-        glow.setCapStyle(Qt.RoundCap)
-        p.strokePath(path, glow)
-    pen = QPen(color, width)
-    pen.setCapStyle(Qt.RoundCap)
-    if dashed:
-        pen.setStyle(Qt.DashLine)
-    if label:
-        # a gap in the line with the value filling it
-        mid = path.pointAtPercent(0.5)
-        fm = QFontMetrics(p.font())
-        w, h = fm.horizontalAdvance(label) + 10, fm.height() + 2
-        gap = QRectF(mid.x() - w / 2, mid.y() - h / 2, w, h)
-        clip = QPainterPath()
-        clip.addRect(path.boundingRect().adjusted(-20, -20, 20, 20))
-        hole = QPainterPath()
-        hole.addRoundedRect(gap, 4, 4)
-        p.save()
-        p.setClipPath(clip.subtracted(hole))
-        p.strokePath(path, pen)
-        p.restore()
-        p.setPen(QPen(color.lighter(130)))
-        p.drawText(gap, Qt.AlignCenter, label)
-    else:
-        p.strokePath(path, pen)
+def link_path(p1: QPointF, p2: QPointF, key: str = "") -> QPainterPath:
+    return SK().link_path(p1, p2, key)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +76,8 @@ class CellItem(QGraphicsObject):
         self.auto_detect = False
         self.events = 0
         self.outcome = None
+        self.signal = False          # audio is (probably) flowing through this cell
+        self.index = 0               # position within its box
         self.hover_port = None
         self._drag_link = False
         self._press_pos = None
@@ -159,9 +111,9 @@ class CellItem(QGraphicsObject):
         return HEADER_H + n * ROW_H + BOTTOM_PAD + (12 if self.also else 0)
 
     def boundingRect(self) -> QRectF:
-        top = -18 if self.volume_text or self.outcome else -2
+        # generous: skins draw placards, floating notes, tilted sticky notes ... around the body
         extra = NS_GAP if self.is_ns else 0
-        return QRectF(-6, top - extra, CELL_W + 12, self.height() - top + 4 + extra)
+        return QRectF(-34, -46 - extra, CELL_W + 68, self.height() + 46 + 32 + extra)
 
     def body_rect(self) -> QRectF:
         return QRectF(0, 0, CELL_W, self.height())
@@ -202,7 +154,8 @@ class CellItem(QGraphicsObject):
         if r is None:
             local = QPointF(0 if side == "in" else CELL_W, HEADER_H / 2)
         else:
-            local = QPointF(r.left() if side == "in" else r.right(), r.center().y())
+            inset = SK().anchor_inset
+            local = QPointF(r.left() + inset if side == "in" else r.right() - inset, r.center().y())
         return self.mapToScene(local)
 
     def port_at(self, local: QPointF):
@@ -217,126 +170,17 @@ class CellItem(QGraphicsObject):
                 return side, "*"
         return None
 
-    # -- paint
+    # -- paint (all of it is the skin's)
+    @property
+    def selected(self) -> bool:
+        return self.editor.is_cell_selected(self.cell_id)
+
+    def fx(self, kind: str):
+        """Seconds since a one-shot effect ("block", "unblock", "closed") started, or None."""
+        return self.editor.fx_age((kind, self.cell_id))
+
     def paint(self, p: QPainter, option, widget=None):
-        th = kit.Theme()
-        p.setRenderHint(QPainter.Antialiasing)
-        dim = self.status in ("closed", "inactive") or self.editor.outcome_box == self.box
-        p.setOpacity(0.55 if dim else 1.0)
-        if self.ghost:
-            p.setOpacity(0.5)
-        body = self.body_rect()
-        radius = min(th.corner_radius, 10)
-        fill = QColor(th.surface())
-        head = QColor(self.color) if self.color else QColor(th.accent())
-        border = QColor(th.border())
-        if self.hub:
-            border = QColor(th.outline())
-            head = QColor(self.color) if self.color else QColor(th.secondary())
-        if self.status == "blocked":
-            fill, head, border = COLOR_BLOCKED.darker(160), COLOR_BLOCKED, COLOR_BLOCKED.lighter(150)
-        elif self.status == "closed":
-            border = COLOR_CLOSED
-            head = QColor(COLOR_CLOSED).darker(220) if not self.color else head
-        if self.editor.outcome_box == self.box:
-            fill, head, border = QColor("#1c1c1c"), QColor("#2a2a2a"), QColor("#3a3a3a")
-
-        if self.is_ns:   # the split: a connector in the gap above, from the hub this hangs off
-            pen = QPen(COLOR_INTERNAL, 2, Qt.DashLine)
-            p.setPen(pen)
-            p.drawLine(QPointF(CELL_W / 2, -NS_GAP + 2), QPointF(CELL_W / 2, -2))
-
-        path = kit.rounded_rect_path(body, radius)
-        p.fillPath(path, fill)
-        hp = kit.rounded_rect_path(QRectF(0, 0, CELL_W, HEADER_H), radius, bottom_left=False, bottom_right=False)
-        p.fillPath(hp, head)
-        pen = QPen(border, 1.6 if self.hub else 1.2)
-        if self.ghost:
-            pen.setStyle(Qt.DashLine)
-        p.setPen(pen)
-        p.drawPath(path)
-        if self.editor.is_cell_selected(self.cell_id):
-            p.setPen(QPen(QColor(255, 255, 255), 2))
-            p.drawPath(path)
-
-        # title
-        f = QFont(p.font())
-        f.setBold(True)
-        f.setPointSizeF(max(7.0, f.pointSizeF()))
-        p.setFont(f)
-        fm = QFontMetrics(f)
-        badges = []
-        if self.speaker:
-            badges.append("🔊" if fm.inFont("🔊") else "SPK")
-        if self.auto_detect:
-            badges.append("^")
-        if self.events:
-            badges.append(f"⚡{self.events}" if fm.inFont("⚡") else f"E{self.events}")
-        badge_txt = " ".join(badges)
-        bw = fm.horizontalAdvance(badge_txt) + 8 if badge_txt else 0
-        title_col = kit.contrast_text(head)
-        if self.status == "closed" and not self.color:
-            title_col = COLOR_CLOSED.lighter(140)
-        p.setPen(title_col)
-        title = fm.elidedText(self.title, Qt.ElideRight, int(CELL_W - 16 - bw))
-        p.drawText(QRectF(8, 0, CELL_W - 16 - bw, HEADER_H), Qt.AlignVCenter | Qt.AlignLeft, title)
-        if badge_txt:
-            p.drawText(QRectF(CELL_W - bw - 6, 0, bw, HEADER_H), Qt.AlignVCenter | Qt.AlignRight, badge_txt)
-
-        # ports
-        pf = QFont(p.font())
-        pf.setBold(False)
-        pf.setPointSizeF(max(6.5, pf.pointSizeF() * 0.85))
-        p.setFont(pf)
-        for side in ("in", "out"):
-            both = self.port_rect(side, "*")
-            if both is not None:
-                hovered = self.hover_port == (side, "*")
-                bfill = QColor(th.secondary()).lighter(135 if hovered else 100)
-                p.setPen(QPen(QColor(th.border()).lighter(130), 1))
-                p.setBrush(bfill)
-                p.drawRoundedRect(both, 6, 6)
-                tab = (QRectF(both.right() - BOTH_EXTRA, both.top(), BOTH_EXTRA, both.height()) if side == "in"
-                       else QRectF(both.left(), both.top(), BOTH_EXTRA, both.height()))
-                p.setPen(kit.contrast_text(bfill))
-                p.drawText(tab, Qt.AlignCenter, "Both")
-            for ch in self.chans(side):
-                r = self.port_rect(side, ch)
-                hovered = self.hover_port == (side, ch)
-                pfill = QColor(th.accent()).lighter(170 if hovered else 125)
-                p.setPen(QPen(QColor(th.border()).lighter(130), 1))
-                p.setBrush(pfill)
-                p.drawRoundedRect(r, 5, 5)
-                p.setPen(kit.contrast_text(pfill))
-                p.drawText(r, Qt.AlignCenter, port_label(ch))
-        p.setBrush(Qt.NoBrush)
-
-        if self.also:
-            p.setPen(QColor(255, 255, 255, 120))
-            sf = QFont(pf)
-            sf.setItalic(True)
-            p.setFont(sf)
-            p.drawText(QRectF(8, self.height() - 16, CELL_W - 16, 14), Qt.AlignLeft | Qt.AlignVCenter,
-                       QFontMetrics(sf).elidedText(self.also, Qt.ElideRight, CELL_W - 16))
-
-        # value above the cell: volume override, or the outcome badge in outcome mode
-        p.setOpacity(1.0)
-        top = None
-        if self.editor.outcome_box == self.box and not self.hub:
-            if self.outcome == "block":
-                top, col = "BLOCK", QColor("#ef4444")
-            elif self.outcome == "unblock":
-                top, col = "UNBLOCK", QColor("#22c55e")
-            else:
-                top, col = "middle-click", QColor(255, 255, 255, 90)
-        elif self.volume_text:
-            top, col = self.volume_text, QColor(th.text())
-        if top:
-            vf = QFont(pf)
-            vf.setBold(True)
-            p.setFont(vf)
-            p.setPen(col)
-            p.drawText(QRectF(0, -18, CELL_W, 16), Qt.AlignCenter, top)
+        SK().paint_cell(p, self)
 
     # -- interaction
     def hoverMoveEvent(self, e):
@@ -406,10 +250,10 @@ class LinkItem(QGraphicsItem):
 
     def set_points(self, p1, p2):
         self.prepareGeometryChange()
-        self.path = link_path(p1, p2)
+        self.path = link_path(p1, p2, self.key)
 
     def boundingRect(self):
-        return self.path.boundingRect().adjusted(-30, -20, 30, 20)
+        return self.path.boundingRect().adjusted(-70, -110, 70, 110)
 
     def shape(self):
         s = QPainterPathStroker()
@@ -417,14 +261,15 @@ class LinkItem(QGraphicsItem):
         return s.createStroke(self.path)
 
     def paint(self, p, option, widget=None):
+        sk = SK()
         if self.internal:
-            paint_link(p, self.path, COLOR_INTERNAL, dashed=True, width=1.6)
+            sk.paint_link(p, self.path, _alpha(sk.col("fg"), 90), LinkLook(self.key, dashed=True, kind="internal"))
             return
         if self.ghost:
-            paint_link(p, self.path, COLOR_GHOST, dashed=True, width=1.6)
+            sk.paint_link(p, self.path, _alpha(sk.col("fg"), 110), LinkLook(self.key, dashed=True, kind="ghost"))
             return
-        color, label = self.editor.link_look(self.key)
-        paint_link(p, self.path, color, selected=self.key in self.editor.selected, label=label)
+        color, look = self.editor.link_info(self.key)
+        sk.paint_link(p, self.path, color, look)
 
     def mousePressEvent(self, e):
         if self.ghost:
@@ -519,29 +364,18 @@ class BoxView(QGraphicsView):
 
     # -- painting
     def drawBackground(self, p, rect):
-        th = kit.Theme()
-        p.fillRect(rect, th.window())
-        step = 40
-        p.setPen(QPen(QColor(255, 255, 255, 14), 1.2))
-        left = math.floor(rect.left() / step) * step
-        top = math.floor(rect.top() / step) * step
-        x = left
-        pts = []
-        while x < rect.right():
-            y = top
-            while y < rect.bottom():
-                pts.append(QPointF(x, y))
-                y += step
-            x += step
-        if len(pts) < 20000:
-            p.drawPoints(pts)
+        SK().paint_background(p, rect, self)
 
     def drawForeground(self, p, rect):
+        p.save()
+        p.resetTransform()
+        SK().paint_foreground(p, self.viewport().width(), self.viewport().height(), self)
+        p.restore()
         if not core.box_enabled(self.editor.c.state, self.box):
             p.save()
             p.resetTransform()
             p.fillRect(self.viewport().rect(), QColor(0, 0, 0, 150))
-            p.setPen(QColor(255, 255, 255, 140))
+            p.setPen(QColor(255, 255, 255, 170))
             p.drawText(self.viewport().rect().adjusted(0, 0, 0, -12), Qt.AlignHCenter | Qt.AlignBottom,
                        "Disabled — right-click the hub to enable")
             p.restore()
@@ -645,6 +479,11 @@ class BoxView(QGraphicsView):
         super().resizeEvent(e)
         self.editor.overlay.update()
 
+    def paintEvent(self, e):
+        t = time.perf_counter()
+        super().paintEvent(e)
+        self.editor._paint_cost += time.perf_counter() - t
+
 
 class BoxWidget(QWidget):
     def __init__(self, editor, box: str):
@@ -704,19 +543,20 @@ class Overlay(QWidget):
             vp = bw.view.viewport()
             clip.addRect(QRectF(QRect(vp.mapTo(self.editor, QPoint(0, 0)), vp.size())))
         p.setClipPath(clip)
+        sk = SK()
         for key, path, kind in self.editor.cross_paths():
             if kind == "ghost":
-                paint_link(p, path, COLOR_GHOST, dashed=True, width=1.6)
+                sk.paint_link(p, path, _alpha(sk.col("fg"), 110), LinkLook(key, dashed=True, kind="ghost"))
             else:
-                color, label = self.editor.link_look(key)
-                paint_link(p, path, color, selected=key in self.editor.selected, label=label)
+                color, look = self.editor.link_info(key)
+                sk.paint_link(p, path, color, look)
         d = self.editor.drag
         if d is not None and d.get("cursor") is not None:
             p.setClipping(False)
             start = d["start_pos"]()
             end = QPointF(self.editor.mapFromGlobal(d["cursor"]))
-            path = link_path(start, end) if d["side"] == "out" else link_path(end, start)
-            paint_link(p, path, QColor(255, 255, 255, 220), dashed=True, width=2)
+            path = link_path(start, end, "drag") if d["side"] == "out" else link_path(end, start, "drag")
+            sk.paint_link(p, path, _alpha(sk.col("fg"), 220), LinkLook("drag", dashed=True, kind="drag"))
 
 
 # ---------------------------------------------------------------------------
@@ -729,6 +569,20 @@ class GraphEditor(QWidget):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.c = controller
+        # -- animation: one clock for the skin, plus one-shot effects keyed (kind, id)
+        self._t0 = time.monotonic()
+        self._fx: dict = {}
+        self._primed = False             # nothing animates in for what already exists at start-up
+        self._known_links: set = set()
+        self._cell_state: dict = {}
+        self._looks: dict = {}
+        self._signal_links: set = set()
+        self._any_signal = False
+        self._tick_n = 0
+        self._paint_cost = 0.0           # seconds spent painting since the last tick
+        self._anim = QTimer(self)
+        self._anim.setInterval(40)
+        self._anim.timeout.connect(self._tick)
         self.selected: set[str] = set()
         self.selected_cells: set[str] = set()
         self.drag = None
@@ -790,10 +644,84 @@ class GraphEditor(QWidget):
             sc.setContext(Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(fn)
 
+        for key, fn in ((Qt.Key_F2, self._key_new_cell), (Qt.Key_F5, self.c.refresh), (Qt.Key_F9, self._key_block)):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(fn)
+
         self.c.state_changed.connect(self.sync)
         self.c.live_changed.connect(self.sync)
         self.sync()
+        self._primed = True
+        for box in self.box_widgets:
+            self.add_fx(("boot", box))
+        self.set_animations(bool(self.c.layout.ui("animations")))
         QTimer.singleShot(0, self._restore_layout)
+
+    # ------------------------------------------------------------ animation
+    def set_animations(self, on: bool):
+        self.animations = bool(on)
+        if on:
+            self._anim.start()
+        else:
+            self._anim.stop()
+            self._fx.clear()
+        self._repaint()
+
+    def add_fx(self, key):
+        if self._primed and getattr(self, "animations", True):
+            self._fx[key] = time.monotonic()
+
+    def fx_age(self, key):
+        t = self._fx.get(key)
+        if t is None:
+            return None
+        age = time.monotonic() - t
+        return age if age < 4.0 else None
+
+    def _tick(self):
+        sk = SK()
+        sk.t = time.monotonic() - self._t0
+        self._tick_n += 1
+        # Adaptive frame rate: never spend more than about a third of the time painting, so a
+        # heavy theme on a big window drops to fewer frames instead of eating a core.
+        cost, self._paint_cost = self._paint_cost, 0.0
+        if cost > 0:
+            want = int(max(40, min(140, cost * 3000)))
+            if abs(want - self._anim.interval()) > 12:
+                self._anim.setInterval(want)
+        if not self.isVisible():
+            return
+        if self._fx:
+            now = time.monotonic()
+            for k in [k for k, t in self._fx.items() if now - t > 4.0]:
+                del self._fx[k]
+        if self._fx or (sk.animated and self._any_signal):
+            self._repaint()                       # full rate while something is moving
+        elif sk.animated and self._tick_n % 6 == 0:
+            self._repaint()                       # ~5 fps for blinks and ambient drift
+
+    def plain_box_label(self, box) -> str:
+        return core.box_label(self.c.state, box)
+
+    def box_link_count(self, box) -> int:
+        st = self.c.state
+        n = 0
+        for l in st["links"]:
+            for end in (l["src"], l["dst"]):
+                b = core.box_of_hub(end) if core.is_hub(end) else (core.cell_by_id(st, end) or {}).get("box")
+                if b == box:
+                    n += 1
+                    break
+        return n
+
+    def _key_new_cell(self):
+        view = self.view_at(self.cursor().pos()) or next(iter(self.box_widgets.values())).view
+        self.new_cell(view.box, view.mapToScene(view.viewport().rect().center()))
+
+    def _key_block(self):
+        if self.selected:
+            self.toggle_link_block(set(self.selected))
 
     # ------------------------------------------------------------ structure
     def _restore_layout(self):
@@ -891,12 +819,67 @@ class GraphEditor(QWidget):
         for c in st["cells"]:
             labels_in_boxes.setdefault(c["label"], set()).add(c["box"])
         for box, ids in placement.items():
-            self._sync_box_cells(self.box_widgets[box].view, box, ids, labels_in_boxes)
+            view = self._sync_box_cells(self.box_widgets[box].view, box, ids, labels_in_boxes)
+            for n, cid in enumerate(i for i in ids if not core.is_hub(i)):
+                view.cells[cid].index = n
         self._sync_links()
+        self._sync_signals()
         self.selected &= {l["id"] for l in st["links"]}
         for bw in self.box_widgets.values():
             bw.view.viewport().update()
         self.overlay.update()
+
+    def _sync_signals(self):
+        """Who is carrying audio (for meters, trains, traces ...) and which one-shot effects start."""
+        st = self.c.state
+        self._looks = {}
+        items = {}
+        for bw in self.box_widgets.values():
+            items.update({cid: it for cid, it in bw.view.cells.items() if not cid.startswith("ghost:")})
+        sig = {cid: (it.status == "active" and not it.hub) for cid, it in items.items()}
+        live = {l["id"]: (not l.get("blocked") and self.c.link_live(l["id"])) for l in st["links"]}
+        carrying = set()
+        for _ in range(4):                       # hubs light up from what flows into them, hop by hop
+            for l in st["links"]:
+                if live[l["id"]] and sig.get(l["src"]):
+                    carrying.add(l["id"])
+                    if core.is_hub(l["dst"]):
+                        sig[l["dst"]] = True
+            for cid in items:
+                if cid.startswith("ns:") or cid.endswith(".mic"):
+                    box = core.box_of_hub(cid)
+                    base = core.HUB_MIC if box == "mic" else core.hub_custom(box.split(".")[1])
+                    if cid.startswith("ns:") and box != "mic" :
+                        base = core.hub_custom(box.split(".")[1])
+                    sig[cid] = sig.get(cid) or bool(sig.get(base))
+        for cid, it in items.items():
+            status = it.status
+            new = bool(sig.get(cid)) and status not in ("blocked", "closed")
+            if new != it.signal:
+                it.signal = new
+                it.update()
+            blocked = status == "blocked"
+            prev = self._cell_state.get(cid)
+            if prev is not None:
+                if blocked and not prev[0]:
+                    self.add_fx(("block", cid))
+                elif prev[0] and not blocked:
+                    self.add_fx(("unblock", cid))
+                if status == "closed" and prev[1] != "closed":
+                    self.add_fx(("closed", cid))
+            self._cell_state[cid] = (blocked, status)
+        for cid in [c for c in self._cell_state if c not in items]:
+            del self._cell_state[cid]
+        ids = {l["id"] for l in st["links"]}
+        for l in st["links"]:
+            if l["id"] not in self._known_links and not l.get("blocked"):
+                self.add_fx(("link", l["id"]))
+                it = items.get(l["src"])
+                if it is not None:
+                    self.add_fx(("flash", it.box))
+        self._known_links = ids
+        self._signal_links = carrying
+        self._any_signal = bool(carrying) or any(sig.values())
 
     def _sync_box_cells(self, view, box, ids, labels_in_boxes):
         st = self.c.state
@@ -1144,7 +1127,7 @@ class GraphEditor(QWidget):
             pb = self._to_editor(b, b.port_scene_pos("in", dch))
             if pa is None or pb is None:
                 continue
-            out.append((key, link_path(pa, pb), kind))
+            out.append((key, link_path(pa, pb, key), kind))
         return out
 
     def _to_editor(self, item, scene_pt):
@@ -1162,29 +1145,59 @@ class GraphEditor(QWidget):
                 return key
         return None
 
-    def link_look(self, key):
-        """(colour, gap label) for a configured link."""
-        st = self.c.state
+    def _link_static(self, key):
+        """What doesn't change between frames, cached until the next sync."""
+        hit = self._looks.get(key)
+        if hit is not None:
+            return hit
+        st, sk = self.c.state, SK()
         l = core.link_by_id(st, key)
         if l is None:
-            return COLOR_PENDING, ""
-        label = ""
-        if l.get("volume", 1.0) != 1.0:
-            label = dlg.format_volume(l["volume"])
-        if l.get("blocked"):
-            return COLOR_BLOCKED, label
-        if not self.c.link_live(key):
-            return COLOR_PENDING, label
-        if l.get("color"):
-            return QColor(l["color"]), label
-        if core.is_hub(l["dst"]):
-            return COLOR_IN, label
-        if core.is_hub(l["src"]):
-            return COLOR_OUT, label
+            return None
+        label = dlg.format_volume(l["volume"]) if l.get("volume", 1.0) != 1.0 else ""
         dst = core.cell_by_id(st, l["dst"])
-        if dst is not None and dst.get("speaker"):
-            return COLOR_BYPASS, label
-        return COLOR_DIRECT, label
+        if core.is_hub(l["dst"]):
+            kind = "in"
+        elif core.is_hub(l["src"]):
+            kind = "out"
+        elif dst is not None and dst.get("speaker"):
+            kind = "bypass"
+        else:
+            kind = "direct"
+        blocked = bool(l.get("blocked"))
+        live = not blocked and self.c.link_live(key)
+        if blocked:
+            color = sk.col("link_blocked")
+        elif not live:
+            color = sk.col("link_pending")
+        elif l.get("color"):
+            color = QColor(l["color"])
+        else:
+            color = sk.link_color(kind)
+        tints = []
+        for end in (l["src"], l["dst"]):
+            cell = core.cell_by_id(st, end)
+            tints.append(QColor(cell["color"]) if cell and cell.get("color") else sk.tint(core.cell_label(st, end)))
+        hit = (color, kind, label, live, blocked, tints[0], tints[1])
+        self._looks[key] = hit
+        return hit
+
+    def link_info(self, key):
+        """(colour, LinkLook) for a configured link -- what the skin needs to draw it."""
+        hit = self._link_static(key)
+        if hit is None:
+            return SK().col("link_pending"), LinkLook(key, live=False)
+        color, kind, label, live, blocked, t0, t1 = hit
+        age = self.fx_age(("link", key))
+        look = LinkLook(key, selected=key in self.selected, label=label, live=live, blocked=blocked, kind=kind,
+                        signal=key in self._signal_links, age=age if age is not None and age < 3.0 else None,
+                        src_tint=t0, dst_tint=t1)
+        return color, look
+
+    def link_look(self, key):
+        """(colour, gap label) for a configured link."""
+        hit = self._link_static(key)
+        return (hit[0], hit[2]) if hit else (SK().col("link_pending"), "")
 
     # ------------------------------------------------------------ moving
     def cell_moved(self, it: CellItem):
@@ -1371,6 +1384,8 @@ class GraphEditor(QWidget):
                 menu.addAction("Master Volume…", lambda: self._hub_volume(it.box))
                 hub = st[it.box] if it.box in ("speaker", "mic") else core.conduit_by_box(st, it.box)
                 menu.addAction("Unmute" if hub.get("muted") else "Mute", lambda: self._hub_mute(it.box))
+            menu.addAction("Equaliser…" + ("  ●" if core.eq_enabled(st, it.box) else ""),
+                           lambda: QTimer.singleShot(0, lambda: self._open_eq(it.box)))
             if core.box_is_microphone(st, it.box):
                 menu.addSeparator()
                 cur = core.ns_method(st, it.box)
@@ -1509,6 +1524,10 @@ class GraphEditor(QWidget):
         if hub is not None:
             hub["enabled"] = not hub.get("enabled", True)
             QTimer.singleShot(0, self.c.commit)
+
+    def _open_eq(self, box):
+        import conduit_eqview
+        conduit_eqview.open_eq(self.window(), self.c, box)
 
     def _hub_volume(self, box):
         def go():

@@ -6,10 +6,13 @@ Two editors over the same ~/.config/conduit/state.json, switched at the very top
   Graphical  a qpwgraph-style node canvas (conduit_graph.py)
   List       the classic Speaker / Microphone / Custom Conduit lists (conduit_list.py)
 
-Auto-apply (default on): every edit writes state.json and restarts the daemon.
-Off: edits stay pending (dirty marker) until Save.  Cell positions, zoom and the
-like live in layout.json, which the daemon never reads -- moving things never
-restarts anything.
+Themes: the "Theme" button switches between eleven complete looks
+(conduit_skins.py).  The Mixing Desk theme adds a third editor, Desk.
+
+Auto-apply (default on): every edit writes state.json; the daemon watches the
+file and applies it within ~100 ms (no restart).  Off: edits stay pending (dirty
+marker) until Save.  Cell positions, zoom, the theme and the like live in
+layout.json, which the daemon never reads.
 
 Flags (apply and exit, no window):
   conduit --micVolume=0.5 | --speakerVolume=2.0
@@ -95,7 +98,7 @@ def handle_cli_args(argv) -> bool:
         changed = True
     if changed:
         core.save_state(state)
-        core.restart_daemon()
+        core.notify_daemon()
     return True
 
 
@@ -112,6 +115,7 @@ import qt_ui_kit as kit  # noqa: E402
 
 from conduit_controller import Controller  # noqa: E402
 from conduit_layout import Layout  # noqa: E402
+import conduit_skins as skins  # noqa: E402
 
 
 def app_icon() -> QIcon:
@@ -126,6 +130,8 @@ class ConduitWindow(QMainWindow):
         self.layout_ = controller.layout if controller else Layout()
         self.c = controller or Controller(self.layout_)
         self._tray = None
+        self._rebuilding = False
+        sk = skins.current()
 
         central = QWidget()
         central.setAutoFillBackground(True)
@@ -134,18 +140,22 @@ class ConduitWindow(QMainWindow):
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(8)
 
-        # -- very top: Graphical | List, and the save state
+        # -- very top: the editor switch, and the save state
+        self.modes = (["desk", "graphical", "list"] if sk.has_desk else ["graphical", "list"])
+        labels = {"desk": "  Desk  ", "graphical": "  Patch  " if sk.has_desk else "  Graphical  ", "list": "  List  "}
         top = QHBoxLayout()
         top.setSpacing(0)
         self.mode_group = QButtonGroup(self)
         self.mode_group.setExclusive(True)
-        self.btn_graph = kit.SegmentButton(None, "left", "  Graphical  ")
-        self.btn_list = kit.SegmentButton(None, "right", "  List  ")
-        for i, b in enumerate((self.btn_graph, self.btn_list)):
+        for i, m in enumerate(self.modes):
+            pos = "left" if i == 0 else "right" if i == len(self.modes) - 1 else "middle"
+            b = kit.SegmentButton(None, pos, labels[m])
             b.setCheckable(True)
             b.setMinimumHeight(32)
             self.mode_group.addButton(b, i)
             top.addWidget(b)
+        self.btn_graph = self.mode_group.button(self.modes.index("graphical"))
+        self.btn_list = self.mode_group.button(self.modes.index("list"))
         self.mode_group.idClicked.connect(self._set_mode)
         top.addSpacing(16)
         self.dirty_label = QLabel("")
@@ -155,21 +165,27 @@ class ConduitWindow(QMainWindow):
         self.revert_btn.setToolTip("Throw away the pending edits and reload the saved config")
         self.revert_btn.clicked.connect(self.c.revert)
         self.save_btn = kit.CustomButton("Save")
-        self.save_btn.setToolTip("Write the config and restart the daemon")
+        self.save_btn.setToolTip("Write the config; the daemon applies it right away")
         self.save_btn.clicked.connect(self.c.save)
         top.addWidget(self.revert_btn)
         top.addSpacing(6)
         top.addWidget(self.save_btn)
+        top.addSpacing(10)
+        self.theme_btn = kit.CustomButton(f"Theme: {sk.name}")
+        self.theme_btn.setToolTip("Switch the whole look: layout, lettering, icons and motion")
+        self.theme_btn.clicked.connect(self._theme_menu)
+        top.addWidget(self.theme_btn)
         v.addLayout(top)
 
         # -- toolbar
         bar = QHBoxLayout()
         bar.setSpacing(10)
         refresh = kit.CustomButton("Refresh devices")
+        refresh.setToolTip("F5")
         refresh.clicked.connect(self.c.refresh)
         bar.addWidget(refresh)
         self.auto_refresh = kit.CustomCheckBox("Auto Refresh Devices")
-        self.auto_refresh.setToolTip("Re-check PipeWire every few seconds (keeps the graph's link colours live)")
+        self.auto_refresh.setToolTip("Re-check PipeWire every 1.5 s (keeps link colours and activity live)")
         self.auto_refresh.setChecked(bool(self.layout_.ui("auto_refresh")))
         self.auto_refresh.toggled.connect(self.c.set_auto_refresh)
         bar.addWidget(self.auto_refresh)
@@ -178,9 +194,18 @@ class ConduitWindow(QMainWindow):
                                   "touching anything on the canvas. Right-click one to add or block it.")
         self.unmanaged.setChecked(bool(self.layout_.ui("show_unmanaged")))
         bar.addWidget(self.unmanaged)
+        self.poll_btn = kit.CustomButton("")
+        self.poll_btn.setToolTip("Polling rate: how quickly the daemon notices new apps and devices")
+        self.poll_btn.clicked.connect(self._poll_menu)
+        bar.addWidget(self.poll_btn)
+        self.c.state_changed.connect(self._sync_poll)
+        self._sync_poll()
+        self.add_strip = kit.CustomButton("+ Device")
+        self.add_strip.setToolTip("Add a device or app as a channel strip")
+        bar.addWidget(self.add_strip)
         bar.addStretch(1)
         self.auto_apply = kit.CustomCheckBox("Auto-apply")
-        self.auto_apply.setToolTip("On: every edit saves and restarts the daemon. Off: edits wait for Save.")
+        self.auto_apply.setToolTip("On: every edit is saved and applied immediately. Off: edits wait for Save.")
         self.auto_apply.setChecked(self.c.auto_apply)
         self.auto_apply.toggled.connect(self._auto_apply_toggled)
         bar.addWidget(self.auto_apply)
@@ -195,6 +220,12 @@ class ConduitWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.graph = GraphEditor(self.c)
         self.list = ListEditor(self.c)
+        self.desk = None
+        if sk.has_desk:
+            from conduit_desk import DeskEditor
+            self.desk = DeskEditor(self.c, self.graph)
+            self.stack.addWidget(self.desk)
+            self.add_strip.clicked.connect(self.desk.new_cell)
         self.stack.addWidget(self.graph)
         self.stack.addWidget(self.list)
         v.addWidget(self.stack, 1)
@@ -203,7 +234,10 @@ class ConduitWindow(QMainWindow):
 
         self.c.dirty_changed.connect(self._dirty)
         self._dirty(self.c.dirty)
-        mode = 1 if self.layout_.ui("mode") == "list" else 0
+        saved = self.layout_.ui("mode")
+        if sk.has_desk and saved == "graphical" and self.layout_.ui("desk_view") != "patch":
+            saved = "desk"
+        mode = self.modes.index(saved) if saved in self.modes else 0
         self.mode_group.button(mode).setChecked(True)
         self._set_mode(mode, animate=False)
 
@@ -212,12 +246,100 @@ class ConduitWindow(QMainWindow):
 
     # -- top bar
     def _set_mode(self, idx, animate=True):
-        self.layout_.set_ui("mode", "list" if idx == 1 else "graphical")
-        self.unmanaged.setVisible(idx == 0)
+        mode = self.modes[idx]
+        if mode == "list":
+            self.layout_.set_ui("mode", "list")
+        else:
+            self.layout_.set_ui("mode", "graphical")
+            self.layout_.set_ui("desk_view", "desk" if mode == "desk" else "patch")
+        self.unmanaged.setVisible(mode == "graphical")
+        self.add_strip.setVisible(mode == "desk")
         if animate and self.stack.currentIndex() != idx:
             kit.crossfade_to_index(self.stack, idx)
         else:
             self.stack.setCurrentIndex(idx)
+
+    def _theme_menu(self):
+        menu = kit.themed_menu("", self)
+        cur = skins.current().key
+        for key in skins.ORDER:
+            cls = skins.SKINS[key]
+            a = menu.addAction(cls.name)
+            a.setToolTip(cls.blurb)
+            a.setCheckable(True)
+            a.setChecked(key == cur)
+            a.triggered.connect(lambda _=False, k=key: QTimer.singleShot(0, lambda: self.set_theme(k)))
+        menu.setToolTipsVisible(True)
+        menu.addSeparator()
+        anim = menu.addAction("Animations")
+        anim.setCheckable(True)
+        anim.setChecked(bool(self.layout_.ui("animations")))
+        anim.triggered.connect(self._set_animations)
+        menu.exec(self.theme_btn.mapToGlobal(self.theme_btn.rect().bottomLeft()))
+
+    @staticmethod
+    def _poll_label(ms):
+        return f"{ms} ms" if ms < 1000 else f"{ms / 1000:g} s"
+
+    def _sync_poll(self):
+        cfg = self.c.state.get("daemon") or core.DEFAULT_DAEMON
+        self.poll_btn.setText(f"Polling: {'instant + ' if cfg['instant'] else ''}{self._poll_label(cfg['poll_ms'])}")
+
+    def _poll_menu(self):
+        cfg = self.c.state.get("daemon") or core.DEFAULT_DAEMON
+        menu = kit.themed_menu("", self)
+
+        def change(**kv):
+            def apply():
+                self.c.state.setdefault("daemon", dict(core.DEFAULT_DAEMON)).update(kv)
+                self.c.commit()
+            QTimer.singleShot(0, apply)
+        a = menu.addAction("Instant: react the moment PipeWire changes")
+        a.setCheckable(True)
+        a.setChecked(cfg["instant"])
+        a.triggered.connect(lambda on: change(instant=bool(on)))
+        menu.addSeparator()
+        t = menu.addAction("Also re-check every" if cfg["instant"] else "Check every")
+        t.setEnabled(False)
+        for ms in core.POLL_CHOICES_MS:
+            a = menu.addAction("    " + self._poll_label(ms) + ("   (uses more CPU)" if ms <= 250 else ""))
+            a.setCheckable(True)
+            a.setChecked(cfg["poll_ms"] == ms)
+            a.triggered.connect(lambda _=False, m=ms: change(poll_ms=m))
+        menu.exec(self.poll_btn.mapToGlobal(self.poll_btn.rect().bottomLeft()))
+
+    def _set_animations(self, on):
+        self.layout_.set_ui("animations", bool(on))
+        self.graph.set_animations(bool(on))
+
+    def set_theme(self, key):
+        """Themes change fonts, metrics and stylesheets, so the window is rebuilt (same controller,
+        same place); nothing about the routing is touched."""
+        if key == skins.current().key or key not in skins.SKINS:
+            return
+        self.layout_.set_ui("theme", key)
+        try:
+            import conduit_eqview
+            conduit_eqview.close_all()
+        except Exception:  # noqa: BLE001
+            pass
+        skins.activate(key)
+        self.layout_.data["window"]["size"] = [self.width(), self.height()]
+        new = ConduitWindow(self.c)
+        new.setGeometry(self.geometry())
+        new._tray, self._tray = self._tray, None
+        if new._tray is not None:
+            new._wire_tray()
+        if self.isMaximized():
+            new.showMaximized()
+        else:
+            new.show()
+        self._rebuilding = True
+        self.c.dirty_changed.disconnect(self._dirty)
+        self.close()
+        self.deleteLater()
+        _windows[:] = [new]
+        return new
 
     def _sync_unmanaged_box(self, on):
         self.unmanaged.blockSignals(True)
@@ -241,16 +363,23 @@ class ConduitWindow(QMainWindow):
         self.setWindowTitle("Conduit" + (" *" if dirty else ""))
 
     # -- tray
+    def _wire_tray(self):
+        menu = kit.themed_menu("", self)
+        menu.addAction("Open Conduit", self._restore)
+        menu.addAction("Quit", self._quit)
+        self._tray.setContextMenu(menu)
+        try:
+            self._tray.activated.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self._tray.activated.connect(
+            lambda r: self._restore() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
+
     def close_to_tray(self):
         if self._tray is None:
-            self._tray = QSystemTrayIcon(app_icon(), self)
+            self._tray = QSystemTrayIcon(app_icon(), QApplication.instance())
             self._tray.setToolTip("Conduit")
-            menu = kit.themed_menu("", self)
-            menu.addAction("Open Conduit", self._restore)
-            menu.addAction("Quit", self._quit)
-            self._tray.setContextMenu(menu)
-            self._tray.activated.connect(
-                lambda r: self._restore() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
+            self._wire_tray()
         self._tray.show()
         self.hide()
 
@@ -260,10 +389,12 @@ class ConduitWindow(QMainWindow):
         self.activateWindow()
 
     def _quit(self):
-        self._tray_quit = True
         self.close()
 
     def closeEvent(self, e):
+        if self._rebuilding:
+            super().closeEvent(e)
+            return
         if self.c.dirty:
             if kit.ask_confirm(self, "Unsaved changes", "Save your pending edits before closing?", "Save"):
                 self.c.save()
@@ -271,6 +402,9 @@ class ConduitWindow(QMainWindow):
         self.layout_.save_now()
         super().closeEvent(e)
         QApplication.instance().quit()
+
+
+_windows: list = []
 
 
 def main():
@@ -285,7 +419,10 @@ def main():
         pass
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
-    w = ConduitWindow()
+    layout = Layout()
+    skins.activate(layout.ui("theme") or "studio", app)
+    w = ConduitWindow(Controller(layout))
+    _windows.append(w)
     w.show()
     w.c.start()
     sys.exit(app.exec())

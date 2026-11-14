@@ -22,6 +22,9 @@ DEFAULT_UI = {
     "auto_apply": True,
     "auto_refresh": True,
     "show_unmanaged": False,
+    "theme": "studio",            # a key of conduit_skins.SKINS
+    "animations": True,
+    "desk_view": "desk",          # Mixing Desk theme: "desk" | "patch"
 }
 
 

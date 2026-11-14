@@ -22,6 +22,10 @@ survives reboots.
   per-link and per-device volume, blocks that silence a device or keep
   a pair from ever being linked, and events ("when OBS starts
   recording, block Spotify").
+- A parametric equaliser on every Conduit device, edited on a real
+  response graph with the live spectrum behind it.
+- Eleven themes that change the whole look and motion, including a
+  mixing-desk view with channel strips instead of a graph.
 - Everything is saved to `~/.config/conduit/state.json` and re-applied
   continuously by a background service, so replugging headphones or
   reopening an app doesn't lose the routing, and nothing needs to be
@@ -93,11 +97,74 @@ The toolbar keeps **Refresh devices**, **Auto Refresh Devices** (on by
 default -- it's what keeps the canvas's link colours live), **Show
 Unmanaged Links** (canvas only), **Auto-apply** and **Close to Tray**.
 
-**Auto-apply** (on by default) does what Conduit always did: every edit
-writes `state.json` and restarts the daemon (debounced ~600 ms). Turn it
-off and edits stay pending -- the top bar shows "● Unsaved changes" and a
-**Save** / **Discard** pair. Closing the window with pending edits asks
-whether to save them.
+**Auto-apply** (on by default): every edit writes `state.json`, and the
+daemon -- which watches that file -- applies it within about 100 ms. No
+service restart is involved any more, so editing never interrupts noise
+suppression or an equaliser. Turn Auto-apply off and edits stay pending:
+the top bar shows "● Unsaved changes" and a **Save** / **Discard** pair.
+Closing the window with pending edits asks whether to save them.
+
+**Polling: …** sets how quickly the daemon notices new apps and devices:
+
+- *Instant* (on by default): the daemon listens to PipeWire's own change
+  events and links a new stream a few tens of milliseconds after it
+  appears. This is what you want.
+- *Also re-check every …* (100 ms – 5 s, default 2 s): a timer on top of
+  that, as a safety net. With Instant switched off it is the only
+  trigger, and the delay before a new thing connects is up to that long.
+  Short intervals cost CPU (each check is a full `pw-dump`).
+
+### Themes
+
+**Theme: …** (top right) switches the whole look. Each theme has its own
+layout details, lettering (fonts ship in `assets/fonts`), port and link
+drawing, wording for the box titles, and its own motion for four
+moments: a link being made, a block, audio flowing, a device closing.
+
+| Theme | What it is | Its motion |
+|---|---|---|
+| Studio | the plain black-and-white look | none |
+| Patch Rack | engraved rack modules, jack sockets, a VU needle on each hub | cables drop in and swing; a toggle switch flips on block |
+| Oscilloscope | phosphor CRT with a graticule | links are traces that wave with audio; power-on sweep; SIG LOST |
+| Transit Map | 45° lines, station dots, interchange capsules | lines extend; trains run on live lines; SERVICE SUSPENDED |
+| Schematic | components, designators, orthogonal nets | current-flow dashes; a switch opens on block; DNP stamp |
+| Terminal | box drawing and monospace, F-key bar | links type out; packets step along wires; [BLOCKED] flash |
+| Liquid Glass | frosted cards over a drifting aurora | a droplet travels a new link; cards sink and get a lock |
+| Swiss Poster | black, white, one red; big numbers | no easing: everything snaps in hard steps |
+| Mixing Desk | a console (see below) | meters, lit routing buttons |
+| Notebook | sticky notes and pen arrows on lined paper | a pencil draws new links; blocks get scribbled out |
+| Arcade | 8-bit sprites, dotted links, a score HUD | chase lights; "+1 LINK!"; shake on block |
+
+"Audio flowing" is inferred (the source is running and the link is
+live); it is activity, not a level measurement. The **Animations**
+switch in the Theme menu turns all motion off. While something is
+animating the canvas repaints at up to 25 fps and backs off by itself
+when painting gets expensive; idle themes only repaint a few times a
+second for blinks. Keys in every theme: **F2** new cell, **F5** refresh
+devices, **F9** block / unblock the selected links, **Del** delete them.
+
+The lists and dialogs take each theme's colours, corners and font; the
+List editor's layout itself is the same in every theme.
+
+### Mixing Desk
+
+The Mixing Desk theme adds a third editor, **Desk | Patch | List**. Every
+cell is a channel strip, each box's virtual device is its master strip:
+
+- **IN** -- the device plays into the box's mix; **OUT** -- the mix is
+  sent to the device; **D:name** (Speaker box) -- straight to that real
+  speaker, bypassing the mix. Lit means linked; click to link / unlink.
+  A red rim means the links exist but are blocked.
+- the fader is the cell's volume (0–2x, snaps at 1x, double-click resets);
+  on a master strip it is the master volume.
+- **MUTE** blocks the cell (master: mutes the device). **ON**, **EQ**,
+  **NS** on a master strip: enable the box, open its equaliser, noise
+  suppression.
+- **+ Device** adds a strip; right-click a strip's name for more.
+
+The desk edits the same links as the graph (the Both-to-Both ones).
+Per-port links, cell-to-cell links, events and colours aren't shown on
+it and are left alone -- use **Patch** for those.
 
 ### Graphical editor
 
@@ -172,7 +239,7 @@ a ghost cell → **Add as Cell**.
 
 Cell positions, zoom, divider sizes and the remembered devices live in
 `~/.config/conduit/layout.json`. The daemon never reads it, and moving
-things never restarts anything.
+things never touches the daemon.
 
 ### List editor
 
@@ -247,6 +314,41 @@ these applies the change and exits immediately without opening a
 window — the GUI only opens when `conduit` is run with no flags at
 all. Getting the target wrong (or leaving it off) prints the list of
 currently valid targets and exits with an error rather than guessing.
+
+## Equaliser
+
+Every Conduit device -- the Virtual Speaker, the Virtual Mic, each Custom
+Conduit -- has its own parametric EQ: the **EQ** button in the box header
+(or right-click the hub → Equaliser…). It shows "EQ ●" while enabled.
+
+The window is a response graph, 20 Hz – 20 kHz against gain in dB:
+
+- the thick curve is what the whole EQ does; thin curves are single bands
+- each band is a numbered handle: **drag** it for frequency and gain,
+  **mouse wheel** for width (Q), **double-click empty space** to add a
+  band there, **double-click a handle** to bypass it, **right-click**
+  for its type (Bell, Low / High shelf, High- / Low-pass, Notch) or to
+  remove it; **Delete** removes the selected band
+- the row underneath edits the selected band by number; **Preamp** is an
+  overall gain (pull it down when you boost, to avoid clipping)
+- **Preset** has starting points (Bass boost, Vocal clarity, Podcast
+  mic, …); up to 12 bands
+- behind the curves, the **live spectrum** of what is coming out of the
+  device right now, after the EQ
+
+How it works: like noise suppression, an enabled EQ is a small
+`pipewire -c` helper the daemon runs (PipeWire's builtin biquad filters,
+no extra packages). The hub's output is routed through it, so everything
+the hub feeds -- speakers, apps recording the mic, noise suppression, a
+conduit's mic tap -- gets the equalised signal. Dragging a handle is
+pushed into the running filter live (`pw-cli set-param`); adding,
+removing or retyping a band restarts just that helper (a brief moment of
+un-equalised audio, no silence). On the mic the order is hub → EQ →
+noise suppression.
+
+The spectrum comes from a capture stream (`pw-record`, falling back to
+`parec`) that exists only while the EQ window is open. If neither tool
+can capture, the graph says so and everything else still works.
 
 ## Noise Suppression
 
@@ -363,6 +465,24 @@ every save):
 systemctl --user restart conduit-daemon
 ```
 
+### Audio doubles for a moment / a new app takes a moment to connect
+
+Both were the same thing: the daemon used to look at PipeWire only every
+2 seconds. WirePlumber links every stream to the default device whenever
+it rescans (any app starting, a notification sound, a new browser tab),
+and until Conduit removed such a link the stream was heard twice -- once
+direct, once through Conduit's own path -- for up to 2 s; a new stream
+likewise waited up to 2 s for its links. The daemon now reacts to
+PipeWire's change events (see **Polling** above), so both windows are a
+few tens of milliseconds. Two related bugs are fixed with it: a link
+with a volume other than 1.0 left WirePlumber's direct link in place
+*permanently* (ungained audio next to the gained copy), and a master
+volume set back to 1.0 never actually returned to 1.0.
+
+If you still hear a blip: make sure Polling shows "instant", and check
+`journalctl --user -u conduit-daemon -f` -- "can't start pw-dump
+--monitor" means it fell back to the timer.
+
 ## Config format
 
 `~/.config/conduit/state.json`, schema version 2 (the full description
@@ -373,6 +493,7 @@ is at the top of `conduit_core.py`):
   "version": 2,
   "speaker": {"enabled": true, "volume": 1.0, "muted": false},
   "mic": {"enabled": true, "volume": 1.0, "muted": false, "noise_suppression": "rnnoise"},
+  "daemon": {"instant": true, "poll_ms": 2000},
   "custom": {"next_id": 2, "conduits": [
     {"id": 1, "name": "Game Audio Mix", "enabled": true, "as_speaker": true,
      "as_microphone": true, "mic_noise_suppression": "webrtc", "volume": 1.0, "muted": false}
@@ -399,6 +520,11 @@ is at the top of `conduit_core.py`):
   `ns:mic` / `ns:custom.<id>`.
 - Ports are PipeWire channel names (`FL`, `FR`, `MONO`, ...). `*` means
   every port; it's what anti-links use.
+- `daemon`: the polling settings. Every hub (`speaker`, `mic`, each
+  conduit) may also carry `"eq": {"enabled": true, "preamp": -3.0,
+  "bands": [{"type": "peaking", "freq": 1000, "q": 1.0, "gain": 4.0,
+  "enabled": true}]}` -- types: peaking, lowshelf, highshelf, highpass,
+  lowpass, notch.
 - A blocked link is an anti-link: that pair is never linked, whoever
   makes it. A blocked cell is silent.
 
@@ -420,19 +546,24 @@ to delete.
 ```
 flake.nix              nixosModules.default + the conduit package / app
 module.nix             services.conduit options, virtual devices, the daemon's user service
-package.nix            the package (scripts, vendored qt_ui_kit, icons, wrapper)
+package.nix            the package (scripts, vendored qt_ui_kit, fonts, icons, wrapper)
 conduit_core.py        state schema + migration, PipeWire parsing, the link plan (shared)
-conduit_daemon.py      the router: polls PipeWire every 2 s and reconciles; runs events
-conduit_gui.py         window, Graphical | List switch, toolbar, tray, CLI flags
+conduit_eq.py          equaliser: filter-chain config, live controls, response maths (shared)
+conduit_daemon.py      the router: event-driven reconcile, helpers (NS / EQ), cell events
+conduit_gui.py         window, editor switch, toolbar, theme switcher, tray, CLI flags
 conduit_controller.py  the GUI's model: edits, auto-apply / save, live refresh
-conduit_graph.py       the node canvas
+conduit_graph.py       the node canvas (interaction; all drawing is the skin's)
+conduit_skin_base.py   what a theme is + the Studio look; shared cell geometry
+conduit_skins.py       the ten themes
+conduit_desk.py        the Mixing Desk editor
+conduit_eqview.py      the equaliser window and spectrum analyser
 conduit_list.py        the list editor
-conduit_header.py      a box's header (shared by both editors)
+conduit_header.py      a box's header (shared by the editors)
 conduit_dialogs.py     auto-detect, noise suppression, volume, colour, New Cell, events
-conduit_layout.py      layout.json (positions, zoom, dividers, remembered devices)
+conduit_layout.py      layout.json (positions, zoom, dividers, theme, remembered devices)
 qt_ui_kit/             vendored theming / widget kit (read its UI_THEMING_GUIDE.md)
-assets/conduit_logo.png
-tests/                 fake PipeWire + daemon, GUI, menu and screenshot tests
+assets/                logo, fonts/ (SIL OFL, see fonts/LICENSE.txt)
+tests/                 fake PipeWire + daemon, GUI, theme, menu and screenshot tests
 ```
 
 ## Tests
@@ -445,8 +576,9 @@ cd conduit
 python3 tests/test_core_daemon.py                                   # model, migration, daemon
 QT_QPA_PLATFORM=offscreen python3 tests/test_gui.py                 # real mouse events on the canvas / lists
 QT_QPA_PLATFORM=offscreen python3 tests/test_menus.py               # every context-menu action
+QT_QPA_PLATFORM=offscreen python3 tests/test_themes.py              # all themes, the EQ window, the desk
 QT_QPA_PLATFORM=offscreen python3 tests/render_screens.py /tmp/shots  # screenshots
 ```
 
 (They need Python 3.11+ with PySide6, e.g.
-`nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (p: [p.pyside6])'`.)
+`nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (p: [p.pyside6 p.numpy])'`.)

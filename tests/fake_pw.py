@@ -25,6 +25,7 @@ class FakePipeWire:
         self.volumes = {}
         self.mutes = {}
         self.defaults = []
+        self.controls = {}     # node id -> filter-chain controls
         self.log = []
 
     def _id(self):
@@ -75,7 +76,18 @@ class FakePipeWire:
     def dump(self):
         out = []
         for nid, n in self.nodes.items():
-            out.append({"id": nid, "type": "PipeWire:Interface:Node", "info": {"props": n["props"], "state": n["state"]}})
+            props = [{"mute": self.mutes.get(nid, False), "channelVolumes": [self.volumes.get(nid, 1.0) ** 3] * 2}]
+            if nid in self.controls:
+                props.append({"params": [x for kv in self.controls[nid].items() for x in kv]})
+            out.append({"id": nid, "type": "PipeWire:Interface:Node",
+                        "info": {"props": n["props"], "state": n["state"], "params": {"Props": props}}})
+        meta = []
+        for nid in self.defaults[-4:]:
+            n = self.nodes.get(nid)
+            if n:
+                key = "default.audio.source" if "Source" in n["props"]["media.class"] else "default.audio.sink"
+                meta = [m for m in meta if m["key"] != key] + [{"key": key, "value": {"name": n["props"]["node.name"]}}]
+        out.append({"id": 9999, "type": "PipeWire:Interface:Metadata", "metadata": meta})
         for pid, p in self.ports.items():
             out.append({"id": pid, "type": "PipeWire:Interface:Port",
                         "info": {"direction": p["dir"], "props": {"node.id": p["node"], "audio.channel": p["channel"]}}})
@@ -111,6 +123,10 @@ class FakePipeWire:
                 self.add_node(name, desc, mc, ins=pos, outs=outs, state="idle")
             elif cmd[1] == "destroy":
                 self.remove_node(int(cmd[2]))
+            elif cmd[1] == "set-param":
+                nid = int(cmd[2])
+                toks = re.findall(r'"([^"]+)"\s+(-?[0-9.]+)', cmd[4])
+                self.controls.setdefault(nid, {}).update({k: float(v) for k, v in toks})
             return _Result()
         if cmd[0] == "wpctl":
             if cmd[1] == "set-volume":
@@ -128,6 +144,45 @@ class FakePipeWire:
         for m in modules:
             m.subprocess.run = self.run          # modules import subprocess at top level
         return self
+
+
+class FakeHelper:
+    pid = 0
+    returncode = None
+
+    def __init__(self, pw, node_ids):
+        self.pw, self.node_ids = pw, node_ids
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        for n in self.node_ids:
+            self.pw.remove_node(n)
+            self.pw.controls.pop(n, None)
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def fake_spawn(pw):
+    """A stand-in for Helpers.spawn: reads the node names (and EQ controls) out of the config."""
+    def spawn(config_text, key):
+        names = re.findall(r'node\.name = "([^"]+)"', config_text)
+        names = [n for n in names if "unused" not in n]
+        nin = pw.add_node(names[0], "helper", "Audio/Sink", ins=("FL", "FR"))
+        nout = pw.add_node(names[1], "helper", "Audio/Source", outs=("FL", "FR"))
+        if key.startswith("eq:"):
+            ctl = {}
+            for name, body in re.findall(r'name = (eq_\w+) label = \w+ control = \{([^}]*)\}', config_text):
+                for k, v in re.findall(r'"(\w+)" = (-?[0-9.]+)', body):
+                    ctl[f"{name}:{k}"] = float(v)
+            pw.controls[nin] = ctl
+        return FakeHelper(pw, [nin, nout]), None
+    return spawn
 
 
 def standard_graph():

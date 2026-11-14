@@ -67,6 +67,11 @@ Blocks
   ``blocked`` on a link: that port pair is never linked (an anti-link).
   ``anti: true`` marks an anti-link Conduit created automatically for a bypass.
 
+Equaliser
+  Every hub dict (speaker, mic, each conduit) may carry "eq": {"enabled", "preamp", "bands": [...]}
+  -- see conduit_eq.py.  While enabled, the hub's output side is the equaliser's output node, so
+  every link out of the hub (and noise suppression, and a conduit's mic tap) gets the EQ'd signal.
+
 Volumes
   A cell's and a link's volume are inline gain stages, multiplied together per
   link: effective = src_cell.volume * link.volume * dst_cell.volume.  A link
@@ -85,6 +90,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import conduit_eq
+
 CONFIG_DIR = Path.home() / ".config" / "conduit"
 STATE_FILE = CONFIG_DIR / "state.json"
 LAYOUT_FILE = CONFIG_DIR / "layout.json"          # GUI only -- the daemon never reads it
@@ -98,7 +105,9 @@ VIRTUAL_MIC = "conduit_virtual_mic"
 CUSTOM_NODE_PREFIX = "conduit_custom_"
 GAIN_NODE_PREFIX = "conduit_gain_"
 NS_NODE_PREFIX = "conduit_ns_"
-OUR_PREFIXES = (CUSTOM_NODE_PREFIX, GAIN_NODE_PREFIX, NS_NODE_PREFIX)
+EQ_NODE_PREFIX = conduit_eq.NODE_PREFIX          # conduit_eq_
+SPECTRUM_NODE_PREFIX = "conduit_spectrum"        # the GUI's analyser capture streams
+OUR_PREFIXES = (CUSTOM_NODE_PREFIX, GAIN_NODE_PREFIX, NS_NODE_PREFIX, EQ_NODE_PREFIX, SPECTRUM_NODE_PREFIX)
 OUR_FIXED_NAMES = {VIRTUAL_SPEAKER, VIRTUAL_MIC}
 
 HUB_SPEAKER = "hub:speaker"
@@ -124,12 +133,33 @@ _CHANNEL_INDEX = {"FL": 0, "FR": 1, "FC": 2, "LFE": 3, "RL": 4, "RR": 5, "SL": 6
                   "MONO": 0, "AUX0": 0, "AUX1": 1, "AUX2": 2, "AUX3": 3}
 
 
+# How quickly the daemon notices new audio things.
+#   instant  react to PipeWire's own change events (a new stream is linked within a few tens of ms)
+#   poll_ms  how often it ALSO re-checks on a timer -- the only mechanism when instant is off
+DEFAULT_DAEMON = {"instant": True, "poll_ms": 2000}
+POLL_CHOICES_MS = (100, 250, 500, 1000, 2000, 5000)
+POLL_MIN_MS, POLL_MAX_MS = 50, 60000
+
+
+def _norm_daemon(raw) -> dict:
+    out = dict(DEFAULT_DAEMON)
+    if isinstance(raw, dict):
+        out["instant"] = bool(raw.get("instant", True))
+        try:
+            out["poll_ms"] = int(max(POLL_MIN_MS, min(POLL_MAX_MS, float(raw.get("poll_ms", 2000)))))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def default_state() -> dict:
     return {
         "version": SCHEMA_VERSION,
-        "speaker": {"enabled": True, "volume": 1.0, "muted": False},
-        "mic": {"enabled": True, "volume": 1.0, "muted": False, "noise_suppression": "none"},
+        "speaker": {"enabled": True, "volume": 1.0, "muted": False, "eq": conduit_eq.default_eq()},
+        "mic": {"enabled": True, "volume": 1.0, "muted": False, "noise_suppression": "none",
+                "eq": conduit_eq.default_eq()},
         "custom": {"next_id": 1, "conduits": []},
+        "daemon": dict(DEFAULT_DAEMON),
         "cells": [],
         "links": [],
         "next_cell_id": 1,
@@ -406,6 +436,7 @@ def migrate_v1(data: dict) -> dict:
             "as_speaker": bool(c.get("as_speaker", True)), "as_microphone": bool(c.get("as_microphone", False)),
             "mic_noise_suppression": method if method in NOISE_SUPPRESSION_METHODS else "none",
             "volume": _valid_float(c.get("volume")), "muted": bool(c.get("muted", False)),
+            "eq": conduit_eq.default_eq(),
         })
         box = f"custom.{cid}"
         hub_lists(box, hub_custom(cid), hub_custom(cid), _migrate_v1_items(c.get("inputs")),
@@ -422,12 +453,14 @@ def normalize(data) -> dict:
     if is_v1(data):
         return migrate_v1(data)
     st = default_state()
+    st["daemon"] = _norm_daemon(data.get("daemon"))
     for hub in ("speaker", "mic"):
         src = data.get(hub) if isinstance(data.get(hub), dict) else {}
         st[hub].update({k: v for k, v in src.items()})
         st[hub]["enabled"] = bool(st[hub].get("enabled", True))
         st[hub]["volume"] = _valid_float(st[hub].get("volume"))
         st[hub]["muted"] = bool(st[hub].get("muted", False))
+        st[hub]["eq"] = conduit_eq.norm_eq(src.get("eq"))
     if st["mic"].get("noise_suppression") not in NOISE_SUPPRESSION_METHODS:
         st["mic"]["noise_suppression"] = "none"
 
@@ -444,7 +477,8 @@ def normalize(data) -> dict:
             "as_speaker": bool(c.get("as_speaker", True)),
             "as_microphone": bool(c.get("as_microphone", False)),
             "mic_noise_suppression": method if method in NOISE_SUPPRESSION_METHODS else "none",
-            "volume": _valid_float(c.get("volume")), "muted": bool(c.get("muted", False))})
+            "volume": _valid_float(c.get("volume")), "muted": bool(c.get("muted", False)),
+            "eq": conduit_eq.norm_eq(c.get("eq"))})
     nid = custom.get("next_id")
     st["custom"]["next_id"] = nid if isinstance(nid, int) and nid > max_id else max_id + 1
 
@@ -537,7 +571,33 @@ def ensure_config_exists() -> None:
 
 
 def restart_daemon() -> None:
+    """Hard restart (tears down noise-suppression / EQ helpers too).  Edits don't need it."""
     subprocess.run(["systemctl", "--user", "restart", "conduit-daemon.service"], capture_output=True)
+
+
+def notify_daemon() -> None:
+    """Called after state.json is written.  The daemon watches the file and applies edits
+    within ~100 ms by itself, so all that's left is making sure it is running at all
+    (`start` is a no-op when it already is)."""
+    try:
+        subprocess.run(["systemctl", "--user", "start", "conduit-daemon.service"], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def hub_config(state: dict, box: str) -> dict:
+    """The settings dict of a box's hub: state["speaker"], state["mic"] or the conduit entry."""
+    if box in ("speaker", "mic"):
+        return state[box]
+    return conduit_by_box(state, box) or {}
+
+
+def eq_config(state: dict, box: str) -> dict:
+    return hub_config(state, box).get("eq") or conduit_eq.default_eq()
+
+
+def eq_enabled(state: dict, box: str) -> bool:
+    return bool(eq_config(state, box).get("enabled"))
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +682,8 @@ def add_conduit(state: dict, name: str | None = None) -> dict:
     cid = state["custom"]["next_id"]
     state["custom"]["next_id"] += 1
     c = {"id": cid, "name": name or f"Custom Conduit {cid}", "enabled": True, "as_speaker": True,
-         "as_microphone": False, "mic_noise_suppression": "none", "volume": 1.0, "muted": False}
+         "as_microphone": False, "mic_noise_suppression": "none", "volume": 1.0, "muted": False,
+         "eq": conduit_eq.default_eq()}
     state["custom"]["conduits"].append(c)
     return c
 
@@ -688,9 +749,14 @@ def pw_dump(log=print):
 
 class Node:
     __slots__ = ("id", "name", "description", "app_name", "media_class", "client_id", "state",
-                 "output_ports", "input_ports")
+                 "output_ports", "input_ports", "volume", "mute", "controls")
 
-    def __init__(self, id_, props, state=""):
+    def __init__(self, id_, props, state="", params=None):
+        self.volume = None            # wpctl-style (cubic) volume, when the dump carries it
+        self.mute = None
+        self.controls = None          # filter-chain controls {"eq_b1:Freq": 1000.0, ...}
+        if params:
+            self._read_props(params)
         self.id = id_
         self.name = props.get("node.name", "") or ""
         self.description = props.get("node.description", self.name) or self.name
@@ -700,6 +766,23 @@ class Node:
         self.state = state or ""
         self.output_ports = []          # [(port_id, channel)]
         self.input_ports = []
+
+    def _read_props(self, params):
+        try:
+            for pr in params.get("Props") or []:
+                if not isinstance(pr, dict):
+                    continue
+                if isinstance(pr.get("mute"), bool):
+                    self.mute = pr["mute"]
+                cv = pr.get("channelVolumes")
+                if isinstance(cv, list) and cv:
+                    self.volume = max(float(v) for v in cv) ** (1.0 / 3.0)
+                ctl = pr.get("params")
+                if isinstance(ctl, list) and len(ctl) >= 2:
+                    self.controls = {ctl[i]: ctl[i + 1] for i in range(0, len(ctl) - 1, 2)
+                                     if isinstance(ctl[i], str) and isinstance(ctl[i + 1], (int, float))}
+        except (TypeError, ValueError, AttributeError):
+            pass
 
     @property
     def is_ours(self) -> bool:
@@ -722,7 +805,11 @@ def build_graph(dump) -> dict:
     for obj in dump:
         if obj.get("type") == "PipeWire:Interface:Node":
             info = obj.get("info") or {}
-            nodes[obj["id"]] = Node(obj["id"], info.get("props") or {}, info.get("state") or "")
+            props = info.get("props") or {}
+            name = props.get("node.name") or ""
+            ours = name in OUR_FIXED_NAMES or name.startswith(OUR_PREFIXES)
+            nodes[obj["id"]] = Node(obj["id"], props, info.get("state") or "",
+                                    info.get("params") if ours else None)
     for obj in dump:
         if obj.get("type") == "PipeWire:Interface:Port":
             info = obj.get("info") or {}
@@ -753,6 +840,24 @@ def current_links(dump) -> set:
     return links
 
 
+def default_devices(dump) -> dict:
+    """{"sink": node name, "source": node name} from the default metadata, when present."""
+    out = {}
+    for obj in dump:
+        if obj.get("type") != "PipeWire:Interface:Metadata":
+            continue
+        for entry in obj.get("metadata") or []:
+            if not isinstance(entry, dict):
+                continue
+            key, value = entry.get("key"), entry.get("value")
+            name = value.get("name") if isinstance(value, dict) else None
+            if key == "default.audio.sink" and name:
+                out["sink"] = name
+            elif key == "default.audio.source" and name:
+                out["source"] = name
+    return out
+
+
 class Snapshot:
     """One pw-dump, parsed.  ``Snapshot.empty()`` when PipeWire isn't reachable."""
 
@@ -760,13 +865,23 @@ class Snapshot:
         self.ok = bool(dump)
         self.nodes = build_graph(dump) if dump else {}
         self.links = current_links(dump) if dump else set()
+        self.defaults = default_devices(dump) if dump else {}
         self.by_name = {n.name: n for n in self.nodes.values()}
+        self.by_label = {}
         self.port_owner = {}
         self.port_channel = {}
+        self.memo = {}                # per-snapshot cache for cell_nodes()
         for n in self.nodes.values():
+            self.by_label.setdefault(n.display_label, []).append(n)
             for pid, ch in n.output_ports + n.input_ports:
                 self.port_owner[pid] = n.id
                 self.port_channel[pid] = ch
+
+    def signature(self):
+        """Changes exactly when something the GUI draws changes (nodes, ports, states, links)."""
+        return (tuple(sorted((n.id, n.name, n.display_label, n.state == "running", len(n.input_ports),
+                              len(n.output_ports)) for n in self.nodes.values())),
+                frozenset(self.links))
 
     @classmethod
     def capture(cls, log=print) -> "Snapshot":
@@ -843,12 +958,19 @@ def cell_nodes(state: dict, cell_id: str, side: str, snap: Snapshot) -> list:
     cell = cell_by_id(state, cell_id)
     if cell is None:
         return []
+    ad = cell.get("auto_detect") or DEFAULT_AUTO_DETECT
+    key = (cell["label"], side, ad.get("prefix"), ad.get("keyword"), ad.get("keyword_text"),
+           ad.get("same_app"), ad.get("anti"), ad.get("anti_keyword_text"))
+    cached = snap.memo.get(key)
+    if cached is not None:
+        return cached
     pred = is_producer if side == "out" else is_consumer
-    labels = expand_auto_detect(cell["label"], cell.get("auto_detect"), snap.nodes, pred)
+    labels = expand_auto_detect(cell["label"], ad, snap.nodes, pred)
     out = []
     for label in sorted(labels):
-        cands = [n for n in snap.nodes.values() if pred(n) and n.display_label == label]
+        cands = [n for n in snap.by_label.get(label, ()) if pred(n)]
         out.extend(_prefer_for_side(cands, side))
+    snap.memo[key] = out
     return out
 
 
@@ -867,11 +989,33 @@ def cell_all_nodes(state: dict, cell_id: str, snap: Snapshot) -> list:
     return out
 
 
-def hub_node(state: dict, cell_id: str, side: str, snap: Snapshot):
-    if cell_id == HUB_SPEAKER:
+def hub_base_node(state: dict, box: str, snap: Snapshot):
+    """The virtual device itself: conduit_virtual_speaker / _mic / conduit_custom_<id>."""
+    if box == "speaker":
         return snap.by_name.get(VIRTUAL_SPEAKER)
-    if cell_id == HUB_MIC:
+    if box == "mic":
         return snap.by_name.get(VIRTUAL_MIC)
+    c = conduit_by_box(state, box)
+    return snap.by_name.get(custom_node_name(c["id"])) if c else None
+
+
+def eq_nodes(state: dict, box: str, snap: Snapshot):
+    """(in node, out node) of a box's running equaliser, or (None, None)."""
+    if not eq_enabled(state, box):
+        return None, None
+    ein, eout = (snap.by_name.get(n) for n in conduit_eq.node_names(box))
+    if ein is None or eout is None:
+        return None, None            # helper not up (yet): the hub is used un-equalised
+    return ein, eout
+
+
+def hub_out_node(state: dict, box: str, snap: Snapshot):
+    """Where a hub's audio comes out: its equaliser's output when one is running."""
+    _ein, eout = eq_nodes(state, box, snap)
+    return eout if eout is not None else hub_base_node(state, box, snap)
+
+
+def hub_node(state: dict, cell_id: str, side: str, snap: Snapshot):
     box = box_of_hub(cell_id)
     if cell_id.startswith("ns:"):
         method = ns_method(state, box)
@@ -882,12 +1026,10 @@ def hub_node(state: dict, cell_id: str, side: str, snap: Snapshot):
                 return n
         # processor off / not up yet: behave like the hub it hangs off
         return hub_node(state, HUB_MIC if box == "mic" else hub_custom_mic(box.split(".")[1]), side, snap)
-    c = conduit_by_box(state, box)
-    if c is None:
-        return None
     if cell_id.endswith(".mic"):
-        return snap.by_name.get(custom_mic_node_name(c["id"])) if c.get("as_microphone") else None
-    return snap.by_name.get(custom_node_name(c["id"]))
+        c = conduit_by_box(state, box)
+        return snap.by_name.get(custom_mic_node_name(c["id"])) if c and c.get("as_microphone") else None
+    return hub_out_node(state, box, snap) if side == "out" else hub_base_node(state, box, snap)
 
 
 # ---------------------------------------------------------------------------
@@ -1016,27 +1158,32 @@ def compute_plan(state: dict, snap: Snapshot) -> Plan:
             plan.internal.add(pair)
         plan.managed_pairs.add((src.id, dst.id))
 
-    # -- hub plumbing: noise-suppression splices and custom mic taps
-    vmic = snap.by_name.get(VIRTUAL_MIC)
-    plan.mic_default = vmic
-    m = ns_method(state, "mic")
-    if m in NOISE_SUPPRESSION_METHODS:
-        pin, pout = (snap.by_name.get(n) for n in noise_processor_names("mic", m))
-        add_internal(vmic, pin)
-        if pout is not None:
-            plan.mic_default = pout
-    for c in state["custom"]["conduits"]:
-        if not c.get("as_microphone"):
+    # -- hub plumbing: base -> [equaliser] -> [noise suppression] -> (mic tap)
+    for box in all_boxes(state):
+        base = hub_base_node(state, box, snap)
+        if base is None:
             continue
-        base, tap = snap.by_name.get(custom_node_name(c["id"])), snap.by_name.get(custom_mic_node_name(c["id"]))
-        src = base
-        m = ns_method(state, f"custom.{c['id']}")
+        out = base
+        ein, eout = eq_nodes(state, box, snap)
+        if ein is not None:
+            add_internal(base, ein)
+            out = eout
+        if box == "mic":
+            plan.mic_default = out
+        ns_out = None
+        m = ns_method(state, box)
         if m in NOISE_SUPPRESSION_METHODS:
-            pin, pout = (snap.by_name.get(n) for n in noise_processor_names(f"custom.{c['id']}", m))
-            if pin is not None and pout is not None:
-                add_internal(base, pin)
-                src = pout
-        add_internal(src, tap)
+            pin, pout = (snap.by_name.get(n) for n in noise_processor_names(box, m))
+            if box == "mic":
+                add_internal(out, pin)
+                if pout is not None:
+                    plan.mic_default = pout
+            elif pin is not None and pout is not None:
+                add_internal(out, pin)
+                ns_out = pout
+        c = conduit_by_box(state, box)
+        if c and c.get("as_microphone"):
+            add_internal(ns_out or out, snap.by_name.get(custom_mic_node_name(c["id"])))
 
     # -- configured links
     for l in state["links"]:
@@ -1070,6 +1217,13 @@ def compute_plan(state: dict, snap: Snapshot) -> Plan:
                 path += pairs
                 if pairs:
                     plan.managed_pairs.add((g.id, d.id))
+            # The direct src -> dst pair is managed too: WirePlumber links a stream straight to
+            # its default sink on its own, and left alone that link plays the ungained signal
+            # next to the gained one (audio doubled up).
+            for s in srcs:
+                for d in dsts:
+                    if s.id != d.id:
+                        plan.managed_pairs.add((s.id, d.id))
         else:
             for s in srcs:
                 for d in dsts:
@@ -1115,6 +1269,8 @@ def unmanaged_links(state: dict, snap: Snapshot, plan: Plan) -> list:
         no, ni = snap.port_owner.get(o), snap.port_owner.get(i)
         if no is None or ni is None or no in plan.gain_nodes or ni in plan.gain_nodes:
             continue
+        if snap.nodes[no].name.startswith(SPECTRUM_NODE_PREFIX) or snap.nodes[ni].name.startswith(SPECTRUM_NODE_PREFIX):
+            continue                 # the GUI's own analyser tap
         if no in watched or ni in watched:
             out.append((o, i))
     return out

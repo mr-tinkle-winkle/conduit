@@ -13,7 +13,8 @@ sys.path.insert(0, str(HERE))
 
 import conduit_core as core  # noqa: E402
 import conduit_daemon as daemon  # noqa: E402
-from fake_pw import standard_graph, V1_README_STATE  # noqa: E402
+import conduit_eq  # noqa: E402
+from fake_pw import standard_graph, fake_spawn, V1_README_STATE  # noqa: E402
 
 FAILS = []
 
@@ -27,6 +28,7 @@ def check(cond, msg):
 def use_tmp_config():
     d = Path(tempfile.mkdtemp())
     core.CONFIG_DIR = d
+    daemon._last_cache_written = None
     core.STATE_FILE = d / "state.json"
     core.LAYOUT_FILE = d / "layout.json"
     core.LINK_CACHE_FILE = d / ".link_cache.json"
@@ -34,32 +36,25 @@ def use_tmp_config():
     return d
 
 
-def fake_ns(pw):
-    """Replace the `pipewire -c` subprocess with nodes appearing directly in the fake graph."""
-    def start(key, method, desc):
-        if (key, method) in daemon._NS_PROCESSES:
-            return
-        i, o = core.noise_processor_names(key, method)
-        nin = pw.add_node(i, desc, "Audio/Sink", ins=("FL", "FR"))
-        nout = pw.add_node(o, desc, "Audio/Source", outs=("FL", "FR"))
-
-        class P:
-            pid = 0
-            returncode = None
-            def poll(self): return None
-            def terminate(self): pw.remove_node(nin); pw.remove_node(nout)
-            def wait(self, timeout=None): return 0
-        daemon._NS_PROCESSES[(key, method)] = {"popen": P(), "config_path": Path("/nonexistent")}
-    daemon._start_ns = start
+CLOCK = [1000.0]
+daemon._RNNOISE_LADSPA_PATH = "/fake/librnnoise_ladspa.so"
 
 
-def cycles(pw, n=3, events=None):
-    events = events or daemon.EventEngine()
+def new_runtime(pw):
+    """A daemon Runtime whose helper processes are nodes appearing in the fake graph."""
+    rt = daemon.Runtime()
+    rt.helpers.spawn = fake_spawn(pw)
+    return rt
+
+
+def cycles(pw, n=3, rt=None, slow=True):
+    rt = rt or new_runtime(pw)
     for _ in range(n):
+        CLOCK[0] += 2.0
         state = core.load_state()
         snap = core.Snapshot(pw.dump())
-        daemon.run_cycle(state, snap, events)
-    return events
+        daemon.run_cycle(state, snap, rt, slow=slow, now=CLOCK[0])
+    return rt
 
 
 def has_link(pw, a, ach, b, bch):
@@ -119,7 +114,6 @@ def test_daemon_routing():
     use_tmp_config()
     pw, ids = standard_graph()
     pw.install(core, daemon)
-    fake_ns(pw)
     core.save_state(core.migrate_v1(copy.deepcopy(V1_README_STATE)))
     cycles(pw, 4)
 
@@ -151,7 +145,6 @@ def test_per_port_and_blocks():
     use_tmp_config()
     pw, ids = standard_graph()
     pw.install(core, daemon)
-    fake_ns(pw)
     st = core.default_state()
     chrome = core.new_cell(st, "Chromium", "speaker")
     core.new_link(st, chrome["id"], "FL", core.HUB_SPEAKER, "FL")
@@ -177,7 +170,7 @@ def test_per_port_and_blocks():
     st = core.load_state()
     core.remove_links(st, [l["id"] for l in st["links"] if l["src"] == chrome["id"]])
     core.save_state(st)
-    cycles(pw, 1, daemon.EventEngine())
+    cycles(pw, 1)
     check(links_between(pw, ids["chromium"], ids["vspk"]) == [], "removed link undone via link cache")
 
     # cell volume x link volume
@@ -202,7 +195,6 @@ def test_events():
     use_tmp_config()
     pw, ids = standard_graph()
     pw.install(core, daemon)
-    fake_ns(pw)
     st = core.default_state()
     obs = core.new_cell(st, "OBS", "mic")
     sp = core.new_cell(st, "spotify", "speaker")
@@ -214,7 +206,7 @@ def test_events():
     pw.nodes[ids["obs"]]["state"] = "running"
     cycles(pw, 1, ev)
     check(not core.cell_by_id(core.load_state(), sp["id"])["blocked"], "active is debounced (1 poll isn't enough)")
-    cycles(pw, 2, ev)
+    cycles(pw, 3, ev)
     check(core.cell_by_id(core.load_state(), sp["id"])["blocked"], "OBS active -> spotify blocked (persisted)")
     check(links_between(pw, ids["spotify"], ids["vspk"]) == [], "...and silenced")
     pw.nodes[ids["obs"]]["state"] = "idle"
@@ -270,7 +262,116 @@ def test_remove_bypass_removes_anti():
     check(not any(l["src"] == sp["id"] for l in st["links"]), "deleting the bypass links removes its auto anti-link")
 
 
+def test_gain_prunes_direct_path():
+    """The doubling bug: WirePlumber's own stream -> default-sink link next to a gained link."""
+    use_tmp_config()
+    pw, ids = standard_graph()
+    pw.install(core, daemon)
+    st = core.default_state()
+    chrome = core.new_cell(st, "Chromium", "speaker")
+    for ch in ("FL", "FR"):
+        core.new_link(st, chrome["id"], ch, core.HUB_SPEAKER, ch, volume=0.5)
+    core.save_state(st)
+    rt = cycles(pw, 3)
+    check(links_between(pw, ids["chromium"], ids["vspk"]) == [], "gained link: WirePlumber's direct link is pruned (no doubling)")
+    # WirePlumber rescans and puts the direct link back; a fast (event) cycle removes it again
+    for ch in ("FL", "FR"):
+        pw.link(pw.port(ids["chromium"], "output", ch), pw.port(ids["vspk"], "input", ch))
+    n_cmds = len(pw.log)
+    cycles(pw, 1, rt, slow=False)
+    check(links_between(pw, ids["chromium"], ids["vspk"]) == [], "re-made direct link removed on the next event cycle")
+    extra = [c for c in pw.log[n_cmds:] if c[0] == "wpctl"]
+    check(not extra, f"event cycle issues no wpctl calls (no feedback loop) {extra[:2]}")
+    n_cmds = len(pw.log)
+    cycles(pw, 2, rt, slow=False)
+    acts = [c for c in pw.log[n_cmds:] if c[0] != "pw-dump"]
+    check(not acts, f"a settled graph produces no commands at all {acts[:2]}")
+
+
+def test_equaliser():
+    use_tmp_config()
+    pw, ids = standard_graph()
+    pw.install(core, daemon)
+    st = core.default_state()
+    ry = core.new_cell(st, "Ryzen HD Audio Controller Analog Stereo", "speaker", speaker=True)
+    for ch in ("FL", "FR"):
+        core.new_link(st, core.HUB_SPEAKER, ch, ry["id"], ch)
+    st["speaker"]["eq"] = {"enabled": True, "preamp": -3.0,
+                           "bands": [{"type": "peaking", "freq": 1000, "q": 1.0, "gain": 4.0, "enabled": True}]}
+    core.save_state(st)
+    rt = cycles(pw, 3)
+    ein, eout = (pw.node_by_name(n) for n in conduit_eq.node_names("speaker"))
+    check(ein is not None and eout is not None, "EQ helper started for the speaker hub")
+    check(links_between(pw, ids["vspk"], ein) == [("FL", "FL"), ("FR", "FR")], "hub -> EQ in")
+    check(links_between(pw, eout, ids["ryzen_sink"]) == [("FL", "FL"), ("FR", "FR")], "EQ out -> speaker")
+    check(links_between(pw, ids["vspk"], ids["ryzen_sink"]) == [], "no un-equalised path next to it")
+    check(pw.controls[ein].get("eq_b1:Gain") == 4.0 and pw.controls[ein].get("eq_pre:Gain") == -3.0, "config carries band + preamp")
+    # live tweak: same structure -> set-param, no restart
+    st = core.load_state()
+    st["speaker"]["eq"]["bands"][0].update(freq=2500.0, gain=-6.0)
+    core.save_state(st)
+    cycles(pw, 2, rt)
+    check(pw.node_by_name(conduit_eq.node_names("speaker")[0]) == ein, "tweaking a band doesn't restart the helper")
+    check(pw.controls[ein].get("eq_b1:Freq") == 2500.0 and pw.controls[ein].get("eq_b1:Gain") == -6.0, "band change pushed live")
+    # structural change -> restart
+    st = core.load_state()
+    st["speaker"]["eq"]["bands"].append({"type": "highpass", "freq": 80, "q": 0.7, "gain": 0, "enabled": True})
+    core.save_state(st)
+    cycles(pw, 3, rt)
+    ein2 = pw.node_by_name(conduit_eq.node_names("speaker")[0])
+    check(ein2 is not None and ein2 != ein, "adding a band restarts the helper")
+    check(links_between(pw, pw.node_by_name(conduit_eq.node_names("speaker")[1]), ids["ryzen_sink"]), "...and it is re-linked")
+    # off -> back to the plain hub
+    st = core.load_state()
+    st["speaker"]["eq"]["enabled"] = False
+    core.save_state(st)
+    cycles(pw, 3, rt)
+    check(pw.node_by_name(conduit_eq.node_names("speaker")[0]) is None, "EQ off stops the helper")
+    check(links_between(pw, ids["vspk"], ids["ryzen_sink"]) == [("FL", "FL"), ("FR", "FR")], "...and the hub feeds the speaker directly again")
+    # mic: EQ then noise suppression, default source follows
+    st = core.load_state()
+    st["mic"]["eq"] = {"enabled": True, "preamp": 0.0, "bands": []}
+    st["mic"]["noise_suppression"] = "rnnoise"
+    core.save_state(st)
+    cycles(pw, 4, rt)
+    min_, mout = (pw.node_by_name(n) for n in conduit_eq.node_names("mic"))
+    nin, nout = (pw.node_by_name(n) for n in core.noise_processor_names("mic", "rnnoise"))
+    check(links_between(pw, ids["vmic"], min_) and links_between(pw, mout, nin), "mic chain: hub -> EQ -> noise suppression")
+    check(pw.defaults[-1] == nout, "default source is the end of the chain")
+    # response maths sanity
+    eq = {"preamp": 0, "bands": [{"type": "peaking", "freq": 1000, "q": 1, "gain": 6, "enabled": True}]}
+    r = conduit_eq.response_db(eq, [1000, 20, 20000])
+    check(abs(r[0] - 6) < 0.05 and abs(r[1]) < 0.2 and abs(r[2]) < 0.3, f"bell response peaks at its gain {r}")
+    hp = conduit_eq.response_db({"preamp": 0, "bands": [{"type": "highpass", "freq": 100, "q": 0.707, "gain": 0, "enabled": True}]}, [100, 1000])
+    check(abs(hp[0] + 3) < 0.2 and abs(hp[1]) < 0.1, f"high-pass is -3 dB at its corner {hp}")
+
+
+def test_master_volume_and_cache():
+    use_tmp_config()
+    pw, ids = standard_graph()
+    pw.install(core, daemon)
+    st = core.default_state()
+    st["speaker"]["volume"] = 2.0
+    core.save_state(st)
+    rt = cycles(pw, 2)
+    check(pw.volumes.get(ids["vspk"]) == 2.0, "master volume applied")
+    st["speaker"]["volume"] = 1.0
+    core.save_state(st)
+    cycles(pw, 2)          # a fresh runtime: remembered across a restart
+    check(pw.volumes.get(ids["vspk"]) == 1.0, "going back to 1.0 resets the device (it used to stay boosted)")
+    pw.volumes[ids["vspk"]] = 0.7     # the user's own wpctl change is then left alone
+    cycles(pw, 2)
+    check(pw.volumes.get(ids["vspk"]) == 0.7, "at 1.0 the device's own volume is left alone")
+    # link cache is by name: a stale id-based cache is ignored
+    core.LINK_CACHE_FILE.write_text(json.dumps([[ids["spotify"], ids["vspk"]]]))
+    cycles(pw, 1)
+    check(links_between(pw, ids["spotify"], ids["vspk"]) == [("FL", "FL"), ("FR", "FR")], "old id-based link cache can't prune anything")
+
+
 if __name__ == "__main__":
+    test_gain_prunes_direct_path()
+    test_equaliser()
+    test_master_volume_and_cache()
     test_migration()
     test_ensure_migrates_file()
     test_daemon_routing()

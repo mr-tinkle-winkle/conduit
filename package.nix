@@ -1,16 +1,19 @@
 # The Conduit package, shared by flake.nix (nix run / nix build) and module.nix.
 #
-#   $out/share/conduit/   conduit_*.py, qt_ui_kit/ (vendored), assets/
+#   $out/share/conduit/   conduit_*.py, qt_ui_kit/ (vendored), assets/ (logo + the themes' fonts)
+#   PATH for the GUI      pw-dump, wpctl, pw-record (pipewire) and parec (pulseaudio, the
+#                         spectrum analyser's fallback capture tool)
 #   $out/bin/conduit      the GUI / CLI flags
 #   $out/share/icons/...  the logo at every launcher size
 #
 # Everything runs from the store path, so a rebuild can never leave a stale
 # copy behind (the old /etc/conduit/*.py copies are gone; /etc/conduit is now
 # just a symlink to share/conduit for poking around).
-{ lib, stdenvNoCC, makeWrapper, imagemagick, python3, qt6, pipewire, wireplumber }:
+{ lib, stdenvNoCC, makeWrapper, imagemagick, python3, qt6, pipewire, wireplumber, pulseaudio }:
 
 let
-  guiPython = python3.withPackages (ps: [ ps.pyside6 ]);
+  # numpy: the equaliser's live spectrum (it falls back to a slow pure-Python FFT without it)
+  guiPython = python3.withPackages (ps: [ ps.pyside6 ps.numpy ]);
   # PySide6 isn't wrapped by wrapQtAppsHook (it's a library), so the platform
   # plugin path has to be set by hand or every launch fails with "could not
   # find the Qt platform plugin".
@@ -26,7 +29,7 @@ let
 in
 stdenvNoCC.mkDerivation {
   pname = "conduit";
-  version = "2.0";
+  version = "2.1";
   inherit src;
   nativeBuildInputs = [ makeWrapper imagemagick ];
   dontBuild = true;
@@ -41,7 +44,7 @@ stdenvNoCC.mkDerivation {
       --set PYTHONDONTWRITEBYTECODE 1 \
       --set QT_PLUGIN_PATH "${qtPluginPath}" \
       --set QT_QPA_PLATFORM_PLUGIN_PATH "${qtPluginPath}/platforms" \
-      --prefix PATH : "${lib.makeBinPath [ pipewire wireplumber ]}"
+      --prefix PATH : "${lib.makeBinPath [ pipewire wireplumber pulseaudio ]}"
 
     ${lib.concatMapStringsSep "\n" (sz: ''
       mkdir -p $out/share/icons/hicolor/${toString sz}x${toString sz}/apps

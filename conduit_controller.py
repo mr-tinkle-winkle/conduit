@@ -2,8 +2,8 @@
 conduit_controller.py -- the one place the GUI's editors read and change the config.
 
 Both editors mutate ``controller.state`` (a v2 state dict) in place and then call
-``commit()``.  With Auto-apply on, that writes state.json and (debounced) restarts
-the daemon; with it off, the edit is kept pending and the window shows a dirty
+``commit()``.  With Auto-apply on, that writes state.json -- the daemon watches the
+file and applies it within ~100 ms, no restart; with it off, the edit is kept pending and the window shows a dirty
 marker until Save.  ``state_changed`` tells both editors to resync; ``live_changed``
 fires after each PipeWire snapshot (taken on a worker thread -- pw-dump can take a
 moment, and widgets must never be touched from a worker thread).
@@ -39,13 +39,14 @@ class Controller(QObject):
         self._status = {}
         self._refreshing = False
         self._refresh_again = False
+        self._snap_sig = None
 
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
-        self._restart_timer.timeout.connect(core.restart_daemon)
+        self._restart_timer.timeout.connect(lambda: core.notify_daemon())
 
         self._auto_timer = QTimer(self)
-        self._auto_timer.setInterval(3000)
+        self._auto_timer.setInterval(1500)
         self._auto_timer.timeout.connect(self.refresh)
 
         self._snapshot_ready.connect(self._on_snapshot)
@@ -125,10 +126,14 @@ class Controller(QObject):
 
     def _on_snapshot(self, snap):
         self._refreshing = False
+        sig = snap.signature() if snap.ok else None
+        changed = sig != self._snap_sig or snap.ok != self.snap.ok
+        self._snap_sig = sig
         self.snap = snap
-        self.layout.remember(snap)
-        self._recompute()
-        self.live_changed.emit()
+        if changed:                       # an unchanged graph costs nothing: no relayout, no repaint
+            self.layout.remember(snap)
+            self._recompute()
+            self.live_changed.emit()
         if self._refresh_again:
             self._refresh_again = False
             self.refresh()
