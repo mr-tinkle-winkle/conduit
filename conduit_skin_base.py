@@ -246,11 +246,20 @@ class Skin:
     margin = 22                  # how far cell decorations may reach outside the body
     canvas = dict(DEFAULT_CANVAS)
     style_args: dict = {}
+    # light skins can offer a dark variant: these override style_args / canvas / instance attributes
+    light = False
+    dark_style_args: dict = {}
+    dark_canvas: dict = {}
+    DARK: dict = {}
 
-    def __init__(self):
+    def __init__(self, dark=False):
         self.t = 0.0
         self._geo = {}
-        self.canvas = {**DEFAULT_CANVAS, **type(self).canvas}
+        self.dark = bool(dark and self.light)
+        self.canvas = {**DEFAULT_CANVAS, **type(self).canvas, **(type(self).dark_canvas if self.dark else {})}
+        if self.dark:
+            for k, v in type(self).DARK.items():
+                setattr(self, k, v)
 
     def cached(self, key, path: QPainterPath, tag: str, make):
         """Per-link geometry that is costly to derive from a path (samples, wobble, dot positions),
@@ -266,8 +275,8 @@ class Skin:
 
     # ---------------------------------------------------------------- chrome
     def style(self) -> Style:
-        s = Style(**self.style_args)
-        s.extra = {"skin": self.key}
+        s = Style(**{**self.style_args, **(self.dark_style_args if self.dark else {})})
+        s.extra = {"skin": self.key, "dark": self.dark}
         return s
 
     def box_title(self, label: str, index: int) -> str:

@@ -1,7 +1,8 @@
 """Render every theme offscreen against the fake PipeWire graph.
    QT_QPA_PLATFORM=offscreen python3 tests/render_screens.py OUTDIR [theme ...]
 Per theme: <key>.png (graph, with a link mid-intro, a blocked and a closed cell),
-<key>_list.png, <key>_eq.png; plus desk_console.png for the Mixing Desk."""
+<key>_list.png, <key>_eq.png; plus desk_console.png for the Mixing Desk.  "metro:dark" renders
+the dark version of a light theme (as metro_dark*.png); with no theme list every theme and dark version."""
 from __future__ import annotations
 import json, math, sys, tempfile, time
 from pathlib import Path
@@ -71,9 +72,12 @@ def main(out, only):
     from conduit_controller import Controller
     from conduit_gui import ConduitWindow
     import conduit_eqview
-    for key in (only or skins.ORDER):
+    keys = only or (list(skins.ORDER) + [k + ":dark" for k in skins.ORDER if skins.SKINS[k].light])
+    for tag in keys:
+        key, _, variant = tag.partition(":")
         fresh_config()
-        skins.activate(key, app)
+        skins.activate(key, app, dark=variant == "dark")
+        key = key + ("_dark" if variant == "dark" else "")
         layout = Layout(); layout.set_ui("auto_refresh", False); layout.set_ui("mode", "graphical"); layout.set_ui("desk_view", "patch")
         c = Controller(layout)
         pw = build(c)

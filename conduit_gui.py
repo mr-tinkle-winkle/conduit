@@ -171,7 +171,7 @@ class ConduitWindow(QMainWindow):
         top.addSpacing(6)
         top.addWidget(self.save_btn)
         top.addSpacing(10)
-        self.theme_btn = kit.CustomButton(f"Theme: {sk.name}")
+        self.theme_btn = kit.CustomButton(f"Theme: {sk.name}{' (dark)' if sk.dark else ''}")
         self.theme_btn.setToolTip("Switch the whole look: layout, lettering, icons and motion")
         self.theme_btn.clicked.connect(self._theme_menu)
         top.addWidget(self.theme_btn)
@@ -271,6 +271,14 @@ class ConduitWindow(QMainWindow):
             a.triggered.connect(lambda _=False, k=key: QTimer.singleShot(0, lambda: self.set_theme(k)))
         menu.setToolTipsVisible(True)
         menu.addSeparator()
+        sk = skins.current()
+        dark = menu.addAction("Dark mode")
+        dark.setCheckable(True)
+        dark.setChecked(sk.dark)
+        dark.setEnabled(sk.light)
+        dark.setToolTip("A dark version of the light themes (Transit Map, Swiss Poster, Notebook)" if not sk.light
+                        else f"Switch {sk.name} between its light and dark version")
+        dark.triggered.connect(lambda on: QTimer.singleShot(0, lambda: self.set_theme(sk.key, dark=bool(on))))
         anim = menu.addAction("Animations")
         anim.setCheckable(True)
         anim.setChecked(bool(self.layout_.ui("animations")))
@@ -312,18 +320,25 @@ class ConduitWindow(QMainWindow):
         self.layout_.set_ui("animations", bool(on))
         self.graph.set_animations(bool(on))
 
-    def set_theme(self, key):
+    def set_theme(self, key, dark=None):
         """Themes change fonts, metrics and stylesheets, so the window is rebuilt (same controller,
-        same place); nothing about the routing is touched."""
-        if key == skins.current().key or key not in skins.SKINS:
+        same place); nothing about the routing is touched.  `dark` switches a light theme's dark version
+        (remembered for every light theme); None keeps the saved choice."""
+        if key not in skins.SKINS:
+            return
+        if dark is None:
+            dark = bool(self.layout_.ui("dark_mode"))
+        cur = skins.current()
+        if key == cur.key and (not cur.light or cur.dark == dark):
             return
         self.layout_.set_ui("theme", key)
+        self.layout_.set_ui("dark_mode", bool(dark))
         try:
             import conduit_eqview
             conduit_eqview.close_all()
         except Exception:  # noqa: BLE001
             pass
-        skins.activate(key)
+        skins.activate(key, dark=dark)
         self.layout_.data["window"]["size"] = [self.width(), self.height()]
         new = ConduitWindow(self.c)
         new.setGeometry(self.geometry())
@@ -420,7 +435,7 @@ def main():
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
     layout = Layout()
-    skins.activate(layout.ui("theme") or "studio", app)
+    skins.activate(layout.ui("theme") or "studio", app, dark=bool(layout.ui("dark_mode")))
     w = ConduitWindow(Controller(layout))
     _windows.append(w)
     w.show()

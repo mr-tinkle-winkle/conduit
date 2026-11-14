@@ -40,7 +40,7 @@ c.set_snapshot(core.Snapshot(pw.dump()))
 skins.activate("studio", app)
 fams = set(QFontDatabase.families())
 need = ["Oswald", "Share Tech Mono", "VT323", "Overpass", "IBM Plex Mono", "JetBrains Mono", "Manrope", "Archivo",
-        "Archivo Black", "Barlow Condensed", "Caveat", "Press Start 2P"]
+        "Archivo Black", "Barlow Condensed", "Caveat", "Press Start 2P", "Barlow", "Space Mono", "Patrick Hand"]
 check(all(f in fams for f in need), f"bundled fonts registered {[f for f in need if f not in fams]}")
 
 w = ConduitWindow(c); w.resize(1400, 900); w.show(); QTest.qWait(200)
@@ -68,6 +68,27 @@ for key in skins.ORDER[1:] + ["studio"]:
     check(ok and json.dumps(c.state, sort_keys=True) == before, f"theme {key}: switches, animates and paints; routing untouched")
     if w.desk is not None:
         check(w.modes == ["desk", "graphical", "list"], "desk theme has Desk | Patch | List")
+# dark versions of the light themes
+for key in [k for k in skins.ORDER if skins.SKINS[k].light]:
+    w = w.set_theme(key, dark=True); QTest.qWait(80)
+    for i in range(6):
+        w.graph._tick(); QTest.qWait(10)
+    sk = skins.current()
+    bg = w.palette().window().color().lightness()
+    check(sk.key == key and sk.dark and layout.ui("dark_mode") and bg < 80 and "(dark)" in w.theme_btn.text(),
+          f"theme {key}: dark version (window lightness {bg})")
+    w = w.set_theme(key, dark=False); QTest.qWait(60)
+    check(not skins.current().dark and w.palette().window().color().lightness() > 180, f"theme {key}: back to light")
+w = w.set_theme("rack", dark=True); QTest.qWait(60)
+check(skins.current().key == "rack" and not skins.current().dark, "dark mode is ignored by themes that are already dark")
+w = w.set_theme("studio", dark=False); QTest.qWait(60)
+# every bundled weight is a real face (variable fonts only exposed one weight to Qt)
+from PySide6.QtGui import QFontInfo
+from conduit_skin_base import F
+for fam, wts in (("Manrope", (400, 600, 800)), ("Archivo", (400, 700, 800)), ("Overpass", (400, 800, 900)),
+                 ("Oswald", (400, 600)), ("Caveat", (400, 700)), ("Barlow", (400, 600))):
+    got = [QFontInfo(F(fam, 12, weight=x)).weight() for x in wts]
+    check(got == list(wts), f"{fam} has real weights {got}")
 check(not ERRORS, f"no exceptions while painting themes {ERRORS[:1]}")
 
 # ---- equaliser window

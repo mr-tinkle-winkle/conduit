@@ -57,7 +57,7 @@ class RackSkin(Skin):
     blurb = "A 19-inch rack: engraved modules, jack sockets, cables that hang and swing."
     animated = True
     anchor_inset = 12.0
-    ui_font = ("Oswald", 10)
+    ui_font = ("Barlow", 10, 500)
     style_args = dict(window="#17181b", base="#1d1e22", surface="#2b2d31", accent="#3a3c41", secondary="#5a5d64",
                       border="#55585f", outline="#e7dfcc", text="#e7dfcc", corner_radius=3)
     canvas = {"link_in": "#c63a2b", "link_out": "#e3ad2f", "link_bypass": "#2c74c4", "link_direct": "#3f9a5c",
@@ -251,7 +251,7 @@ class ScopeSkin(Skin):
     key, name = "scope", "Oscilloscope"
     blurb = "Phosphor CRT: a graticule, glowing traces that wave with the audio."
     animated = True
-    ui_font = ("VT323", 13)
+    ui_font = ("Space Mono", 9)
     style_args = dict(window="#020b06", base="#03100a", surface="#06180f", accent="#0b2a19", secondary="#155a33",
                       border="#1d6b3f", outline="#39ff88", text="#b8ffd0", corner_radius=2)
     canvas = {"link_in": "#7dff9b", "link_out": "#c6ff5a", "link_bypass": "#5affe0", "link_direct": "#e9ff70",
@@ -368,7 +368,7 @@ class ScopeSkin(Skin):
         col = QColor(self.PH)
         if hovered:
             p.fillRect(r, col)
-        text(p, r, f"[{port_label(ch)}]", F("VT323", 15), "#020b06" if hovered else col, C, fit=False)
+        text(p, r, f"[{port_label(ch)}]", F("VT323", 17, spacing=0.4), "#020b06" if hovered else col, C, fit=False)
 
     def paint_both(self, p, it, side, rect, hovered):
         col = QColor(self.PH)
@@ -376,7 +376,7 @@ class ScopeSkin(Skin):
         p.setBrush(alpha(col, 40) if hovered else Qt.NoBrush)
         p.drawRect(rect)
         p.setBrush(Qt.NoBrush)
-        text(p, self.both_tab(side, rect), "BOTH", F("VT323", 13), alpha(col, 255 if hovered else 150), C)
+        text(p, self.both_tab(side, rect), "BOTH", F("VT323", 15, spacing=0.6), alpha(col, 255 if hovered else 150), C)
 
     def paint_link(self, p, path, color, L):
         p.setRenderHint(QPainter.Antialiasing)
@@ -414,7 +414,7 @@ class ScopeSkin(Skin):
             p.drawEllipse(head, 3.5, 3.5)
             p.setBrush(Qt.NoBrush)
         if L.label:
-            _tag(p, path, L.label, F("VT323", 15), "#020b06", color, 0, color)
+            _tag(p, path, L.label, F("VT323", 17, spacing=0.4), "#020b06", color, 0, color)
 
     def eq_colors(self):
         return {"bg": QColor("#020b06"), "grid": QColor(29, 90, 51, 150), "text": QColor("#8dffb0"),
@@ -431,23 +431,29 @@ class MetroSkin(Skin):
     blurb = "A subway map: 45-degree lines, stations, trains carrying the audio."
     animated = True
     anchor_inset = 4.0
-    ui_font = ("Overpass", 10)
+    ui_font = ("Overpass", 10, 500)
     style_args = dict(window="#f4f1e8", base="#ebe7db", surface="#ffffff", accent="#e2ddd0", secondary="#c9c3b3",
                       border="#16161a", outline="#16161a", text="#16161a", text_outline="#ffffff", corner_radius=6)
     canvas = {"link_in": "#1f5fbf", "link_out": "#ef8a17", "link_bypass": "#2e9a52", "link_direct": "#8b3fbf",
               "link_pending": "#b9b4a8", "link_blocked": "#9c988e", "closed": "#a39f95", "fg": "#16161a",
               "link_width": 7.0}
-    INK = "#16161a"
+    INK, BG, CARD, RIVER, CLOSED, YELLOW_DIM = "#16161a", "#f4f1e8", "#ffffff", "#cfe4ee", "#a39f95", "#f2e9b0"
+    light = True
+    dark_style_args = dict(window="#14161b", base="#1b1e24", surface="#23272e", accent="#2d323a", secondary="#3b414b",
+                           border="#e9e6dc", outline="#e9e6dc", text="#e9e6dc", text_outline="#000000")
+    dark_canvas = {"link_in": "#3d84ea", "link_pending": "#55524c", "link_blocked": "#6c6962", "closed": "#5f5c56",
+                   "fg": "#e9e6dc"}
+    DARK = dict(INK="#e9e6dc", BG="#14161b", CARD="#23272e", RIVER="#18303d", CLOSED="#7a766d", YELLOW_DIM="#5e5320")
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, dark=False):
+        super().__init__(dark)
         self.title_font = F("Overpass", 17, weight=900, spacing=0.5)
 
     def box_title(self, label, index):
         return f"{label} District"
 
     def paint_background(self, p, rect, view):
-        p.fillRect(rect, QColor("#f4f1e8"))
+        p.fillRect(rect, QColor(self.BG))
         # one river across every map, for orientation
         river = QPainterPath(QPointF(rect.left() - 20, 250))
         x = math.floor(rect.left() / 400) * 400 - 400
@@ -455,13 +461,13 @@ class MetroSkin(Skin):
         while x < rect.right() + 400:
             x += 100
             river.lineTo(x, 240 + 30 * math.sin(x / 260) + 18 * math.sin(x / 97))
-        stroke(p, river, QColor("#cfe4ee"), 46)
+        stroke(p, river, QColor(self.RIVER), 46)
 
     def paint_body(self, p, it):
         b = self.body(it)
         closed = it.status == "closed"
-        ink = QColor("#a39f95" if closed else self.INK)
-        fill = QColor(self.INK) if it.hub else QColor("#ffffff")
+        ink = QColor(self.CLOSED if closed else self.INK)
+        fill = QColor(self.INK) if it.hub else QColor(self.CARD)
         if it.color:
             fill = QColor(it.color)
         pen = QPen(ink, 3)
@@ -474,8 +480,10 @@ class MetroSkin(Skin):
         if it.selected:
             p.setPen(QPen(QColor("#ffd400"), 3))
             p.drawRoundedRect(b.adjusted(-4, -4, 4, 4), 10, 10)
-        light = fill.lightness() < 130
-        tcol = QColor("#ffffff") if light else ink
+        if closed:
+            tcol = QColor(self.CLOSED)
+        else:
+            tcol = QColor("#ffffff") if fill.lightness() < 130 else QColor("#16161a")
         tf = F("Overpass", 13, weight=800)
         tf.setStrikeOut(closed)
         badge = self.badges(it, "♪", "^", "E")
@@ -496,29 +504,29 @@ class MetroSkin(Skin):
             on = int(self.t * 2.5) % 2 == 0
             r = QRectF(CELL_W / 2 - 78, b.height() + 5, 156, 18)
             p.setPen(QPen(QColor(self.INK), 1.5))
-            p.setBrush(QColor("#ffd400") if on else QColor("#f2e9b0"))
+            p.setBrush(QColor("#ffd400") if on else QColor(self.YELLOW_DIM))
             p.drawRoundedRect(r, 3, 3)
             p.setBrush(Qt.NoBrush)
-            text(p, r, "⚠ SERVICE SUSPENDED", F("Overpass", 10, weight=900), self.INK, C)
+            text(p, r, "⚠ SERVICE SUSPENDED", F("Overpass", 10, weight=900), "#16161a" if on or not self.dark else "#ffd400", C)
 
     def paint_port(self, p, it, side, ch, rect, hovered):
         cx = rect.left() + 4 if side == "in" else rect.right() - 4
         cy = rect.center().y()
         p.setPen(QPen(QColor(self.INK), 3))
-        p.setBrush(QColor("#ffd400" if hovered else "#ffffff"))
+        p.setBrush(QColor("#ffd400" if hovered else self.CARD))
         p.drawEllipse(QPointF(cx, cy), 6.2, 6.2)
         p.setBrush(Qt.NoBrush)
         lr = QRectF(cx + 9, cy - 7, 14, 14) if side == "in" else QRectF(cx - 23, cy - 7, 14, 14)
-        dark = it.hub and not it.color
-        text(p, lr, port_label(ch), F("Overpass", 10, weight=800), "#ffffff" if dark else self.INK, C)
+        fill = QColor(it.color) if it.color else QColor(self.INK if it.hub else self.CARD)
+        text(p, lr, port_label(ch), F("Overpass", 10, weight=800), "#ffffff" if fill.lightness() < 130 else "#16161a", C)
 
     def paint_both(self, p, it, side, rect, hovered):
         # an interchange capsule around the L and R stations, with a tab to grab
         p.setPen(QPen(QColor(self.INK), 2))
-        p.setBrush(QColor("#ffd400" if hovered else "#f4f1e8"))
+        p.setBrush(QColor("#ffd400" if hovered else self.BG))
         p.drawRoundedRect(rect, 9, 9)
         p.setBrush(Qt.NoBrush)
-        text(p, self.both_tab(side, rect), "BOTH", F("Overpass", 8, weight=900), self.INK, C)
+        text(p, self.both_tab(side, rect), "BOTH", F("Overpass", 8, weight=900), "#16161a" if hovered else self.INK, C)
 
     def link_path(self, a, b, key=""):
         dx, ady = b.x() - a.x(), abs(b.y() - a.y())
@@ -554,7 +562,7 @@ class MetroSkin(Skin):
                 p.translate(pt)
                 p.rotate(-path.angleAtPercent(u))
                 p.setPen(QPen(QColor(color), 2.4))
-                p.setBrush(QColor("#ffffff"))
+                p.setBrush(QColor(self.CARD))
                 p.drawRoundedRect(QRectF(-9, -4.5, 18, 9), 3.5, 3.5)
                 p.restore()
             p.setBrush(Qt.NoBrush)
@@ -563,12 +571,12 @@ class MetroSkin(Skin):
             a = 255 if L.age < 1.9 else 255 * (2.4 - L.age) / 0.5
             r = QRectF(mid.x() - 52, mid.y() - 30, 104, 20)
             p.setPen(Qt.NoPen)
-            p.setBrush(alpha(self.INK, a))
+            p.setBrush(alpha("#16161a", a))
             p.drawRoundedRect(r, 3, 3)
             p.setBrush(Qt.NoBrush)
             text(p, r, "NEW SERVICE", F("Overpass", 10, weight=900), alpha("#ffd400", a), C)
         if L.label:
-            _tag(p, path, L.label, F("Overpass", 10, weight=800), "#ffffff", self.INK, 8, self.INK)
+            _tag(p, path, L.label, F("Overpass", 10, weight=800), self.CARD, self.INK, 8, self.INK)
 
 
 # =====================================================================================
@@ -915,7 +923,7 @@ class GlassSkin(Skin):
     key, name = "glass", "Liquid Glass"
     blurb = "Frosted cards over a drifting aurora; springy and soft."
     animated = True
-    ui_font = ("Manrope", 10)
+    ui_font = ("Manrope", 10, 500)
     style_args = dict(window="#0c1316", base="#101a1e", surface="#1a272c", accent="#26373d", secondary="#14b8a6",
                       border="#3a4d54", outline="#d7e6ea", text="#f2f6f7", corner_radius=16)
     canvas = {"link_in": "#5eead4", "link_out": "#fb7185", "link_bypass": "#a3e635", "link_direct": "#c4b5fd",
@@ -1102,16 +1110,22 @@ class SwissSkin(Skin):
     key, name = "swiss", "Swiss Poster"
     blurb = "International style: black, white, one red. Nothing eases, everything snaps."
     animated = True
-    ui_font = ("Archivo", 10)
+    ui_font = ("Archivo", 10, 500)
     style_args = dict(window="#fafaf7", base="#f0f0ea", surface="#ffffff", accent="#e6e6df", secondary="#ff2a12",
                       border="#0a0a0a", outline="#0a0a0a", text="#0a0a0a", text_outline="#ffffff", corner_radius=0)
     canvas = {"link_in": "#0a0a0a", "link_out": "#ff2a12", "link_bypass": "#1f3fff", "link_direct": "#6f6f66",
               "link_pending": "#b9b9b3", "link_blocked": "#ff2a12", "closed": "#8a8a84", "fg": "#0a0a0a",
               "link_width": 3.0}
-    INK, RED, PAPER = "#0a0a0a", "#ff2a12", "#fafaf7"
+    INK, RED, PAPER, GHOST = "#0a0a0a", "#ff2a12", "#fafaf7", "#efefe9"
+    light = True
+    dark_style_args = dict(window="#0d0d0d", base="#151515", surface="#1c1c1c", accent="#262626",
+                           border="#f2f2ec", outline="#f2f2ec", text="#f2f2ec", text_outline="#000000")
+    dark_canvas = {"link_in": "#f2f2ec", "link_bypass": "#4f6bff", "link_direct": "#8f8f88", "link_pending": "#4a4a46",
+                   "closed": "#6a6a64", "fg": "#f2f2ec"}
+    DARK = dict(INK="#f2f2ec", PAPER="#0d0d0d", GHOST="#171717")
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, dark=False):
+        super().__init__(dark)
         self.title_font = F("Archivo Black", 18, caps=True)
 
     def box_title(self, label, index):
@@ -1123,14 +1137,15 @@ class SwissSkin(Skin):
         f = F("Archivo Black", 150, spacing=-5)
         r = QRectF(-520, 70, 2400, 190)
         if rect.intersects(r):
-            text(p, r, label, f, "#efefe9", fit=False)
+            text(p, r, label, f, self.GHOST, fit=False)
 
     def paint_body(self, p, it):
         b = self.body(it)
         closed = it.status == "closed"
         hub = it.hub
         fill = QColor(it.color) if it.color else QColor(self.INK if hub else self.PAPER)
-        ink = QColor(self.PAPER) if fill.lightness() < 130 else QColor(self.INK)
+        lo, hi = sorted((QColor(self.INK), QColor(self.PAPER)), key=QColor.lightness)
+        ink = hi if fill.lightness() < 130 else lo
         p.fillRect(b, fill)
         p.fillRect(QRectF(0, 0, CELL_W, 5), QColor(self.RED if hub else self.INK))
         if it.ghost:
@@ -1246,7 +1261,7 @@ class DeskSkin(Skin):
     blurb = "A console: every device is a channel strip, links are lit routing buttons."
     animated = True
     has_desk = True
-    ui_font = ("Barlow Condensed", 11)
+    ui_font = ("Barlow", 10, 500)
     style_args = dict(window="#1c1d20", base="#17181b", surface="#2a2c31", accent="#3a3d44", secondary="#ffb43a",
                       border="#4a4d55", outline="#d9d9d4", text="#d9d9d4", corner_radius=4)
     canvas = {"link_in": "#ffb43a", "link_out": "#7ad3ff", "link_bypass": "#7bf0a0", "link_direct": "#e6a0ff",
@@ -1364,25 +1379,34 @@ class SketchSkin(Skin):
     key, name = "sketch", "Notebook"
     blurb = "Hand-drawn on lined paper: sticky notes and pen arrows."
     animated = True
-    ui_font = ("Caveat", 14)
+    ui_font = ("Patrick Hand", 12)
     style_args = dict(window="#fbf8ef", base="#f3eee0", surface="#fffdf6", accent="#ece5d0", secondary="#ffe98a",
                       border="#2b2b33", outline="#2b2b33", text="#2b2b33", text_outline="#ffffff", corner_radius=5)
     canvas = {"link_in": "#2b59c3", "link_out": "#d1442f", "link_bypass": "#2a7a3a", "link_direct": "#7a3fa8",
               "link_pending": "#a9a59a", "link_blocked": "#d1442f", "closed": "#9a968a", "fg": "#2b2b33",
               "link_width": 2.3}
-    INK = "#2b2b33"
+    INK, PAPER, RULE, HUB, MUTED = "#2b2b33", "#fbf8ef", "#cfe0f0", "#fffdf6", "#55555e"
+    RED, GREEN, TAPE, PORT = "#d1442f", "#2a7a3a", QColor(255, 255, 255, 150), QColor(255, 255, 255, 150)
     NOTES = ["#ffe98a", "#cfe3ff", "#c9f2d3", "#ffc2d1", "#ffd8a8", "#e3d3ff"]
+    light = True
+    dark_style_args = dict(window="#1c1e23", base="#23262c", surface="#2a2d34", accent="#343842", secondary="#6b5d22",
+                           border="#e6e1d3", outline="#e6e1d3", text="#e6e1d3", text_outline="#000000")
+    dark_canvas = {"link_in": "#79a2ff", "link_out": "#ff7a62", "link_bypass": "#6bd17d", "link_direct": "#c093ff",
+                   "link_pending": "#5c5966", "link_blocked": "#ff7a62", "closed": "#6e6a75", "fg": "#e6e1d3"}
+    DARK = dict(INK="#e6e1d3", PAPER="#1c1e23", RULE="#283241", HUB="#262930", MUTED="#a9a4b3", RED="#ff7a62",
+                GREEN="#6bd17d", TAPE=QColor(255, 255, 255, 38), PORT=QColor(0, 0, 0, 70),
+                NOTES=["#4d4423", "#24395a", "#22432c", "#4f2a36", "#4f3922", "#3a2f55"])
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, dark=False):
+        super().__init__(dark)
         self.title_font = F("Caveat", 24, bold=True)
 
     def box_title(self, label, index):
         return f"{label.lower()} stuff"
 
     def paint_background(self, p, rect, view):
-        p.fillRect(rect, QColor("#fbf8ef"))
-        p.setPen(QPen(QColor("#cfe0f0"), 1.2))
+        p.fillRect(rect, QColor(self.PAPER))
+        p.setPen(QPen(QColor(self.RULE), 1.2))
         y = math.floor(rect.top() / 28) * 28
         lines = []
         while y < rect.bottom():
@@ -1422,32 +1446,34 @@ class SketchSkin(Skin):
         seed = hseed(it.cell_id)
         ink = QColor(self.INK)
         if it.hub:
-            p.fillRect(b, QColor("#fffdf6"))
+            p.fillRect(b, QColor(self.HUB))
             stroke(p, self._wobbly_rect(b, seed), ink, 2.4)
             stroke(p, self._wobbly_rect(b.adjusted(-3, -3, 3, 3), seed + 9, 2.0), alpha(ink, 150), 1.1)
         else:
             p.fillRect(b.translated(3, 5), QColor(0, 0, 0, 20))
             p.fillRect(b, QColor(it.color) if it.color else QColor(self.NOTES[seed % len(self.NOTES)]))
+            if it.color and self.dark and QColor(it.color).lightness() > 150:
+                ink = QColor("#2b2b33")                      # a custom pale note keeps dark pen
             p.save()
             p.translate(CELL_W / 2, 0)
             p.rotate(-self._angle(it) * 2)
-            p.fillRect(QRectF(-26, -8, 52, 15), QColor(255, 255, 255, 150))
+            p.fillRect(QRectF(-26, -8, 52, 15), self.TAPE)
             p.restore()
             if it.ghost:
                 stroke(p, self._wobbly_rect(b, seed), alpha(ink, 160), 1.2, Qt.DashLine)
         if it.selected:
-            stroke(p, self._wobbly_rect(b.adjusted(-6, -6, 6, 6), seed + 3, 2.2), QColor("#d1442f"), 2)
+            stroke(p, self._wobbly_rect(b.adjusted(-6, -6, 6, 6), seed + 3, 2.2), QColor(self.RED), 2)
         badge = self.badges(it, "♪", "^", "!")
         bf = F("Caveat", 15, bold=True)
         bw = QFontMetricsF(bf).horizontalAdvance(badge) + 6 if badge else 0
         text(p, QRectF(10, 2, CELL_W - 20 - bw, HEADER_H), it.title, F("Caveat", 20, bold=True), ink)
         if badge:
-            text(p, QRectF(CELL_W - bw - 8, 2, bw, HEADER_H), badge, bf, "#d1442f", R_ | V)
+            text(p, QRectF(CELL_W - bw - 8, 2, bw, HEADER_H), badge, bf, self.RED, R_ | V)
         m = self.mid(it)
         word = self.status_word(it, "playing ♪", "quiet", "muted!!", "(closed for now)")
         if it.hub and it.status == "active":
             word = "cleans up noise" if it.is_ns else "the mix!"
-        text(p, m, word, F("Caveat", 15), "#d1442f" if (it.hub and not it.is_ns) or it.status == "blocked" else "#55555e", C)
+        text(p, m, word, F("Patrick Hand", 13), self.RED if (it.hub and not it.is_ns) or it.status == "blocked" else (self.MUTED if ink == QColor(self.INK) else alpha(ink, 180)), C)
         if it.status == "blocked":
             rng = Rng(seed + 11)
             pts = [QPointF(8, 20)]
@@ -1459,7 +1485,7 @@ class SketchSkin(Skin):
             age = it.fx("block")
             if age is not None and age < 0.65:
                 path = partial(path, age / 0.65, 60)
-            stroke(p, path, QColor("#d1442f"), 3)
+            stroke(p, path, QColor(self.RED), 3)
         if it.signal and not it.hub:
             wig = 5 * math.sin(self.t * 9 + it.index)
             p.save()
@@ -1470,18 +1496,18 @@ class SketchSkin(Skin):
             arcs.quadTo(11, 0, 4, 8)
             arcs.moveTo(11, -14)
             arcs.quadTo(22, 0, 11, 14)
-            stroke(p, arcs, QColor("#2a7a3a"), 2.1)
+            stroke(p, arcs, QColor(self.GREEN), 2.1)
             p.restore()
             u = (self.t * 0.5 + (seed % 10) / 10.0) % 1.0
-            text(p, QRectF(CELL_W - 26, -12 - 26 * u, 20, 20), "♪", F("Caveat", 20, bold=True), alpha("#2a7a3a", 255 * (1 - u)), C)
+            text(p, QRectF(CELL_W - 26, -12 - 26 * u, 20, 20), "♪", F("Caveat", 20, bold=True), alpha(self.GREEN, 255 * (1 - u)), C)
 
     def paint_port(self, p, it, side, ch, rect, hovered):
         cx = rect.left() + 11 if side == "in" else rect.right() - 11
         cy = rect.center().y()
         seed = hseed(it.cell_id + side + ch)
-        ink = QColor("#d1442f" if hovered else self.INK)
+        ink = QColor(self.RED if hovered else self.INK)
         p.setPen(QPen(ink, 1.6))
-        p.setBrush(QColor(255, 255, 255, 150))
+        p.setBrush(self.PORT)
         p.drawEllipse(QPointF(cx + (seed % 3) * 0.4, cy), 8.2, 7.0)
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(alpha(ink, 120), 0.9))
@@ -1489,9 +1515,9 @@ class SketchSkin(Skin):
         text(p, QRectF(cx - 8, cy - 8, 16, 16), port_label(ch), F("Caveat", 14, bold=True), ink, C, fit=False)
 
     def paint_both(self, p, it, side, rect, hovered):
-        ink = QColor("#d1442f" if hovered else self.INK)
+        ink = QColor(self.RED if hovered else self.INK)
         stroke(p, self._wobbly_rect(rect.adjusted(1, 0, -1, 0), hseed(it.cell_id + side), 1.0), alpha(ink, 200), 1.3)
-        text(p, self.both_tab(side, rect), "both", F("Caveat", 13), ink, C)
+        text(p, self.both_tab(side, rect), "both", F("Patrick Hand", 11), ink, C)
 
     def link_path(self, a, b, key=""):
         return bezier(a, b)
@@ -1549,9 +1575,9 @@ class SketchSkin(Skin):
             x.lineTo(mid.x() + 7, mid.y() + 8)
             x.moveTo(mid.x() - 7, mid.y() + 8)
             x.lineTo(mid.x() + 8, mid.y() - 8)
-            stroke(p, x, QColor("#d1442f"), 3)
+            stroke(p, x, QColor(self.RED), 3)
         elif L.label:
-            _tag(p, path, L.label, F("Caveat", 15, bold=True), "#fffdf6", color, 6, color)
+            _tag(p, path, L.label, F("Patrick Hand", 13), self.HUB, color, 6, color)
 
 
 # =====================================================================================
@@ -1762,14 +1788,16 @@ def current() -> Skin:
     return _current
 
 
-def activate(key: str, app=None) -> Skin:
-    """Make a skin current: kit style + palette + UI font.  Build (or rebuild) windows afterwards."""
+def activate(key: str, app=None, dark: bool = False) -> Skin:
+    """Make a skin current: kit style + palette + UI font.  Build (or rebuild) windows afterwards.
+    `dark` picks the dark version of a light skin (ignored by the dark ones)."""
     global _current
     import qt_ui_kit as kit
     from PySide6.QtGui import QFont as _QFont
     from PySide6.QtWidgets import QApplication
     load_fonts()
-    _current = SKINS.get(key, Skin)()
+    cls = SKINS.get(key, Skin)
+    _current = cls(dark=dark) if cls.light else cls()
     kit.set_style(_current.style())
     app = app or QApplication.instance()
     if app is not None:
@@ -1782,6 +1810,7 @@ def activate(key: str, app=None) -> Skin:
             f = _QFont(default)
             f.setFamilies([_current.ui_font[0]] + default.families())
             f.setPointSize(_current.ui_font[1])
+            f.setWeight(_QFont.Weight(_current.ui_font[2] if len(_current.ui_font) > 2 else 400))
             app.setFont(f)
         else:
             app.setFont(default)

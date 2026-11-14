@@ -143,8 +143,15 @@ when painting gets expensive; idle themes only repaint a few times a
 second for blinks. Keys in every theme: **F2** new cell, **F5** refresh
 devices, **F9** block / unblock the selected links, **Del** delete them.
 
+The three light themes (Transit Map, Swiss Poster, Notebook) have a dark
+version: **Theme → Dark mode** (remembered, and used by whichever light
+theme you pick; the other themes are dark already).
+
 The lists and dialogs take each theme's colours, corners and font; the
-List editor's layout itself is the same in every theme.
+List editor's layout itself is the same in every theme. Themes whose
+display face is condensed (Patch Rack, Oscilloscope, Mixing Desk,
+Notebook) use a wider companion font for buttons and lists. The bundled
+fonts are static weights (Qt only sees one weight of a variable font).
 
 ### Mixing Desk
 

@@ -24,6 +24,7 @@ DEFAULT_UI = {
     "show_unmanaged": False,
     "theme": "studio",            # a key of conduit_skins.SKINS
     "animations": True,
+    "dark_mode": False,           # the dark version of a light theme (Transit Map, Swiss Poster, Notebook)
     "desk_view": "desk",          # Mixing Desk theme: "desk" | "patch"
 }
 
