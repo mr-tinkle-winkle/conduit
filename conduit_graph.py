@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (QApplication, QGraphicsItem, QGraphicsObject, QGr
 import qt_ui_kit as kit
 
 import conduit_core as core
+import conduit_listen
 import time
 
 import conduit_dialogs as dlg
@@ -73,6 +74,7 @@ class CellItem(QGraphicsObject):
         self.color: str | None = None
         self.also = ""
         self.speaker = False
+        self.listening = False           # "Listen to this device" is on (badge)
         self.auto_detect = False
         self.events = 0
         self.outcome = None
@@ -712,6 +714,7 @@ class GraphEditor(QWidget):
 
         self.c.state_changed.connect(self.sync)
         self.c.live_changed.connect(self.sync)
+        conduit_listen.manager(self.c).changed.connect(self._sync_listening)
         self.sync()
         self._primed = True
         for box in self.box_widgets:
@@ -897,6 +900,7 @@ class GraphEditor(QWidget):
                 view.cells[cid].index = n
         self._sync_links()
         self._sync_signals()
+        self._sync_listening(repaint=False)
         self.selected &= {l["id"] for l in st["links"]}
         for bw in self.box_widgets.values():
             bw.view.refresh(background=True)
@@ -1486,6 +1490,7 @@ class GraphEditor(QWidget):
                 menu.addAction("Unmute" if hub.get("muted") else "Mute", lambda: self._hub_mute(it.box))
             menu.addAction("Equaliser…" + ("  ●" if core.eq_enabled(st, it.box) else ""),
                            lambda: QTimer.singleShot(0, lambda: self._open_eq(it.box)))
+            self._listen_action(menu, it.cell_id)
             if core.box_is_microphone(st, it.box):
                 menu.addSeparator()
                 cur = core.ns_method(st, it.box)
@@ -1507,6 +1512,7 @@ class GraphEditor(QWidget):
         n = len(cell.get("events", []))
         menu.addAction("Add Event…" + (f"  ({n})" if n else ""), lambda: QTimer.singleShot(0, lambda: self.open_events(cid)))
         menu.addAction(f"Volume…  ({dlg.format_volume(cell['volume'])})", lambda: QTimer.singleShot(0, lambda: self._cell_volume(cid)))
+        self._listen_action(menu, cid)
         menu.addAction("Recolor…", lambda: QTimer.singleShot(0, lambda: self._cell_color(cid)))
         if cell.get("color"):
             menu.addAction("Reset Colour", lambda: self._set_cell(cid, color=None))
@@ -1523,6 +1529,28 @@ class GraphEditor(QWidget):
         menu.addSeparator()
         menu.addAction("Delete", lambda: self._delete_cell(cid))
         self._exec_menu(menu, gpos)
+
+    def _sync_listening(self, repaint=True):
+        mgr = conduit_listen.manager(self.c)
+        for bw in self.box_widgets.values():
+            for it in bw.view.cells.values():
+                on = mgr.is_on(it.cell_id)
+                if it.listening != on:
+                    it.listening = on
+                    it.update()
+
+    def _listen_action(self, menu, cell_id):
+        """"Listen to this device": hear it through the speakers (a checkable menu entry)."""
+        mgr = conduit_listen.manager(self.c)
+        a = menu.addAction("Listen to this Device")
+        a.setCheckable(True)
+        a.setChecked(mgr.is_on(cell_id))
+        ok = core.listen_supported(self.c.state, cell_id)
+        a.setEnabled(ok)
+        if not ok:
+            a.setToolTip("You already hear the Virtual Speaker")
+        a.triggered.connect(lambda on: mgr.toggle(cell_id, bool(on)))
+        return a
 
     def link_menu(self, key, gpos):
         st = self.c.state

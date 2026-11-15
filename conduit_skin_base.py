@@ -365,7 +365,7 @@ class Skin:
         left, right = edge(it.ins), CELL_W - edge(it.outs)
         return QRectF(left, HEADER_H, right - left, it.height() - HEADER_H - BOTTOM_PAD)
 
-    def badges(self, it, speaker="SPK", auto="^", event="E") -> str:
+    def badges(self, it, speaker="SPK", auto="^", event="E", listen="LSN") -> str:
         out = []
         if it.speaker:
             out.append(speaker)
@@ -373,6 +373,8 @@ class Skin:
             out.append(auto)
         if it.events:
             out.append(f"{event}{it.events}")
+        if getattr(it, "listening", False):
+            out.append(listen)
         return " ".join(out)
 
     def status_word(self, it, live="live", idle="idle", blocked="blocked", closed="closed") -> str:

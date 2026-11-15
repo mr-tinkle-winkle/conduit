@@ -127,7 +127,9 @@ def main(out, only):
             acc = 0.97 * acc + 0.03 * random.uniform(-1, 1)
             samples.append(acc * 2.2 + 0.05 * math.sin(2 * math.pi * 220 * i / 48000) + 0.02 * math.sin(2 * math.pi * 3100 * i / 48000)
                            + 0.01 * random.uniform(-1, 1))
-        dlg.tap.feed(samples); dlg.tap._analyse(); dlg._spectrum()
+        # two frames (a quiet one, then the loud one) so time smoothing has something to hold back
+        dlg.tap.feed([v * 0.08 for v in samples]); dlg.tap._analyse(); dlg._frame()
+        dlg.tap.feed(samples); dlg.tap._analyse(); dlg._frame()
         QTest.qWait(80)
         dlg.grab().save(str(out / f"{key}_eq.png"))
         dlg.close()

@@ -107,7 +107,9 @@ GAIN_NODE_PREFIX = "conduit_gain_"
 NS_NODE_PREFIX = "conduit_ns_"
 EQ_NODE_PREFIX = conduit_eq.NODE_PREFIX          # conduit_eq_
 SPECTRUM_NODE_PREFIX = "conduit_spectrum"        # the GUI's analyser capture streams
-OUR_PREFIXES = (CUSTOM_NODE_PREFIX, GAIN_NODE_PREFIX, NS_NODE_PREFIX, EQ_NODE_PREFIX, SPECTRUM_NODE_PREFIX)
+LISTEN_NODE_PREFIX = "conduit_listen_"           # the GUI's "Listen to this device" loopbacks
+GUI_PREFIXES = (SPECTRUM_NODE_PREFIX, LISTEN_NODE_PREFIX)
+OUR_PREFIXES = (CUSTOM_NODE_PREFIX, GAIN_NODE_PREFIX, NS_NODE_PREFIX, EQ_NODE_PREFIX) + GUI_PREFIXES
 OUR_FIXED_NAMES = {VIRTUAL_SPEAKER, VIRTUAL_MIC}
 
 HUB_SPEAKER = "hub:speaker"
@@ -1269,8 +1271,62 @@ def unmanaged_links(state: dict, snap: Snapshot, plan: Plan) -> list:
         no, ni = snap.port_owner.get(o), snap.port_owner.get(i)
         if no is None or ni is None or no in plan.gain_nodes or ni in plan.gain_nodes:
             continue
-        if snap.nodes[no].name.startswith(SPECTRUM_NODE_PREFIX) or snap.nodes[ni].name.startswith(SPECTRUM_NODE_PREFIX):
-            continue                 # the GUI's own analyser tap
+        if snap.nodes[no].name.startswith(GUI_PREFIXES) or snap.nodes[ni].name.startswith(GUI_PREFIXES):
+            continue                 # the GUI's own analyser tap / listen loopback
         if no in watched or ni in watched:
             out.append((o, i))
     return out
+
+
+# ---------------------------------------------------------------------------
+# "Listen to this device" (GUI-side monitoring loopback)
+# ---------------------------------------------------------------------------
+
+def listen_supported(state: dict, cell_id: str) -> bool:
+    """Everything with an output can be listened to, except the Virtual Speaker itself:
+    you already hear it, and looping it back into the speakers it feeds would only double it."""
+    if cell_id == HUB_SPEAKER:
+        return False
+    return is_hub(cell_id) or cell_by_id(state, cell_id) is not None
+
+
+def listen_source(state: dict, cell_id: str, snap: Snapshot):
+    """The node whose audio Listen plays: a hub's output (after its equaliser), a cell's first
+    live producer node."""
+    nodes = cell_nodes(state, cell_id, "out", snap)
+    return nodes[0] if nodes else None
+
+
+def listen_sink(state: dict, snap: Snapshot):
+    """Where Listen plays: the real output the Virtual Speaker is playing on, else a cell marked
+    Real Speaker, else the default sink when it is hardware, else any hardware sink."""
+    out = hub_out_node(state, "speaker", snap)
+    if out is not None:
+        for o, i in sorted(snap.links):
+            if snap.port_owner.get(o) == out.id:
+                n = snap.nodes.get(snap.port_owner.get(i))
+                if n is not None and is_hardware_sink(n):
+                    return n
+    for cell in state.get("cells", []):
+        if cell.get("speaker"):
+            for n in cell_nodes(state, cell["id"], "in", snap):
+                if is_hardware_sink(n):
+                    return n
+    d = snap.by_name.get(snap.defaults.get("sink") or "")
+    if d is not None and is_hardware_sink(d):
+        return d
+    sinks = sorted((n for n in snap.nodes.values() if is_hardware_sink(n)), key=lambda n: n.id)
+    return sinks[0] if sinks else None
+
+
+def listen_command(cell_id: str, label: str, src, sink) -> list:
+    """pw-loopback from `src` (a sink is captured from its monitor) to `sink`."""
+    safe = "".join(ch if ch.isalnum() else "_" for ch in cell_id)
+    name = f"{LISTEN_NODE_PREFIX}{safe}"
+    label = label.replace('"', "'")
+    cap = (f'node.name = "{name}_in" node.description = "Conduit Listen in - {label}" '
+           f'target.object = "{src.name}" node.dont-reconnect = true '
+           f'stream.capture.sink = {"true" if src.media_class.endswith("Sink") else "false"}')
+    play = (f'node.name = "{name}_out" node.description = "Conduit Listen - {label}" '
+            f'media.name = "Listen: {label}" target.object = "{sink.name}" node.dont-reconnect = true')
+    return ["pw-loopback", "-n", name, "--latency", "40", "--capture-props", cap, "--playback-props", play]

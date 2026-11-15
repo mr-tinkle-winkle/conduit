@@ -84,6 +84,10 @@ cid = c.state["cells"][0]["id"]
 g.open_events(cid); g.new_cell("speaker", QPointF(0, 0)); g.new_speaker(QPointF(0, 0))
 QTest.qWait(100)
 print(f"menus opened: {len(seen)}, actions fired: {sum(len(s) for s in seen)}")
+n_listen = sum("Listen to this Device" in s for s in seen)
+if n_listen < 3:
+    ERRORS.append(f"Listen to this Device missing from cell menus (found in {n_listen})")
+__import__("conduit_listen").manager(c).stop_all()
 if ERRORS:
     print("\n".join(ERRORS[:5])); print(f"{len(ERRORS)} ERRORS"); sys.exit(1)
 print("ALL PASS")

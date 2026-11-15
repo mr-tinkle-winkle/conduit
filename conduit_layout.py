@@ -24,7 +24,12 @@ DEFAULT_UI = {
     "show_unmanaged": False,
     "theme": "studio",            # a key of conduit_skins.SKINS
     "animations": True,
-    "dark_mode": False,           # the dark version of a light theme (Transit Map, Swiss Poster, Notebook)
+    "dark_mode": False,
+    "eq_smooth": True,            # equaliser spectrum: smoothing across frequency (amount 0..1)
+    "eq_smooth_amount": 0.5,
+    "eq_time": True,              # ... and over time (no big jumps between frames)
+    "eq_time_amount": 0.5,
+    "eq_lock_x": False,           # dragging a handle only changes its gain           # the dark version of a light theme (Transit Map, Swiss Poster, Notebook)
     "desk_view": "desk",          # Mixing Desk theme: "desk" | "patch"
 }
 

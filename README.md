@@ -342,8 +342,33 @@ The window is a response graph, 20 Hz – 20 kHz against gain in dB:
   overall gain (pull it down when you boost, to avoid clipping)
 - **Preset** has starting points (Bass boost, Vocal clarity, Podcast
   mic, …); up to 12 bands
+- **default points**: the first time a device's EQ is opened it gets
+  flat, labelled handles on the areas worth tuning -- voice points on a
+  microphone (Boom, Mud, Boxy, Nasal, Presence, Sibilance, Air), audio
+  points elsewhere (Sub-bass, Bass, Low-mids, Mids, Upper mids, Presence,
+  Air). They do nothing until you move one; the first edit switches the
+  EQ on. Preset → *Voice / Audio tuning points* brings them back
+- **Lock X** (or hold **Shift** while dragging) keeps a handle on its
+  frequency, so dragging only changes the gain
 - behind the curves, the **live spectrum** of what is coming out of the
-  device right now, after the EQ
+  device right now, after the EQ. **Smoothing** blends it across
+  neighbouring frequencies, **Time smoothing** stops it jumping large
+  amounts between frames; both are on by default with an adjustable
+  amount (remembered in layout.json). Wherever either one is reshaping
+  the spectrum it is tinted in its own colour (see the legend), stronger
+  the harder it is working
+- **Listen** plays the device through your speakers while you tune it
+
+### Listen to this Device
+
+Right-click any cell or hub → **Listen to this Device** (or tick
+**Listen** in its EQ window) to hear it through your real speakers --
+handy for hearing your own mic with its EQ and noise suppression. It is a
+`pw-loopback` from the device to the output the Virtual Speaker plays on
+(or the cell marked Real Speaker, or the default hardware sink). Cells
+being listened to show **LSN**. It follows the device if it restarts or
+appears later, is never saved, and stops when Conduit closes. The Virtual
+Speaker itself can't be listened to: you already hear it.
 
 How it works: like noise suppression, an enabled EQ is a small
 `pipewire -c` helper the daemon runs (PipeWire's builtin biquad filters,
@@ -565,7 +590,8 @@ conduit_graph.py       the node canvas (interaction; all drawing is the skin's)
 conduit_skin_base.py   what a theme is + the Studio look; shared cell geometry
 conduit_skins.py       the ten themes
 conduit_desk.py        the Mixing Desk editor
-conduit_eqview.py      the equaliser window and spectrum analyser
+conduit_eqview.py      the equaliser window, spectrum analyser and smoothing
+conduit_listen.py      "Listen to this Device" (pw-loopback to the real speakers)
 conduit_list.py        the list editor
 conduit_header.py      a box's header (shared by the editors)
 conduit_dialogs.py     auto-detect, noise suppression, volume, colour, New Cell, events

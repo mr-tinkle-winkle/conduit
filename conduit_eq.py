@@ -9,6 +9,8 @@ In state.json each hub (speaker, mic, every Custom Conduit) may carry:
            "bands": [{"type": "peaking", "freq": 1000.0, "q": 1.0, "gain": 4.0, "enabled": true}, ...]}
 
 Types: peaking, lowshelf, highshelf (use gain), highpass, lowpass, notch (ignore gain).
+A band may carry a "label" (what that frequency area is, e.g. "Presence").  "seeded" records that
+the EQ window already gave this device its default points (voice or audio tuning).
 
 How it runs: one `pipewire -c` helper per equalised hub (exactly like noise
 suppression) with a chain of PipeWire's builtin biquads:
@@ -41,7 +43,7 @@ NODE_PREFIX = "conduit_eq_"
 
 
 def default_eq() -> dict:
-    return {"enabled": False, "preamp": 0.0, "bands": []}
+    return {"enabled": False, "preamp": 0.0, "bands": [], "seeded": False}
 
 
 def _f(v, default, lo, hi):
@@ -59,7 +61,8 @@ def norm_band(b) -> "dict | None":
         return None
     return {"type": b["type"], "freq": _f(b.get("freq"), 1000.0, FREQ_MIN, FREQ_MAX),
             "q": _f(b.get("q"), 1.0, Q_MIN, Q_MAX), "gain": _f(b.get("gain"), 0.0, GAIN_MIN, GAIN_MAX),
-            "enabled": bool(b.get("enabled", True))}
+            "enabled": bool(b.get("enabled", True)),
+            **({"label": str(b["label"])[:24]} if isinstance(b.get("label"), str) and b["label"].strip() else {})}
 
 
 def norm_eq(raw) -> dict:
@@ -68,6 +71,7 @@ def norm_eq(raw) -> dict:
         return eq
     eq["enabled"] = bool(raw.get("enabled", False))
     eq["preamp"] = _f(raw.get("preamp"), 0.0, GAIN_MIN, GAIN_MAX)
+    eq["seeded"] = bool(raw.get("seeded", False))
     bands = [norm_band(b) for b in raw.get("bands", []) if True] if isinstance(raw.get("bands"), list) else []
     eq["bands"] = [b for b in bands if b][:MAX_BANDS]
     return eq
@@ -198,11 +202,32 @@ def log_freqs(n: int, lo: float = FREQ_MIN, hi: float = FREQ_MAX) -> list:
     return [lo * (hi / lo) ** (i / (n - 1)) for i in range(n)]
 
 
-def _b(t, f, g=0.0, q=0.9):
-    return {"type": t, "freq": float(f), "q": float(q), "gain": float(g), "enabled": True}
+def _b(t, f, g=0.0, q=0.9, label=None):
+    b = {"type": t, "freq": float(f), "q": float(q), "gain": float(g), "enabled": True}
+    if label:
+        b["label"] = label
+    return b
+
+
+# Default points: flat (0 dB) handles parked on the areas you normally reach for, so tuning
+# is "grab Presence and lift it" instead of "where was presence again?".
+VOICE_POINTS = [_b("lowshelf", 100, 0, 0.7, "Boom"), _b("peaking", 250, 0, 1.2, "Mud"),
+                _b("peaking", 500, 0, 1.4, "Boxy"), _b("peaking", 1000, 0, 1.4, "Nasal"),
+                _b("peaking", 3000, 0, 1.0, "Presence"), _b("peaking", 6500, 0, 2.0, "Sibilance"),
+                _b("highshelf", 10000, 0, 0.7, "Air")]
+AUDIO_POINTS = [_b("peaking", 50, 0, 1.0, "Sub-bass"), _b("peaking", 120, 0, 1.0, "Bass"),
+                _b("peaking", 300, 0, 1.2, "Low-mids"), _b("peaking", 1000, 0, 1.0, "Mids"),
+                _b("peaking", 2500, 0, 1.2, "Upper mids"), _b("peaking", 5000, 0, 1.2, "Presence"),
+                _b("highshelf", 10000, 0, 0.7, "Air")]
+
+
+def default_points(voice: bool) -> list:
+    return [dict(b) for b in (VOICE_POINTS if voice else AUDIO_POINTS)]
 
 
 PRESETS = {
+    "Voice tuning points": {"preamp": 0.0, "bands": VOICE_POINTS},
+    "Audio tuning points": {"preamp": 0.0, "bands": AUDIO_POINTS},
     "Flat": {"preamp": 0.0, "bands": []},
     "Bass boost": {"preamp": -4.0, "bands": [_b("lowshelf", 110, 6.0, 0.7), _b("peaking", 60, 2.0, 1.0)]},
     "Bass cut": {"preamp": 0.0, "bands": [_b("highpass", 90, q=0.707), _b("lowshelf", 200, -3.0, 0.7)]},
