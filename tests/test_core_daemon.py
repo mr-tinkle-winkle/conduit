@@ -313,6 +313,32 @@ def test_equaliser():
     cycles(pw, 2, rt)
     check(pw.node_by_name(conduit_eq.node_names("speaker")[0]) == ein, "tweaking a band doesn't restart the helper")
     check(pw.controls[ein].get("eq_b1:Freq") == 2500.0 and pw.controls[ein].get("eq_b1:Gain") == -6.0, "band change pushed live")
+    # a long drag (values change every cycle, the graph hasn't reported them back yet) never
+    # restarts the helper -- a restart drops the GUI's analyser and Listen
+    pw.ignore_set_param = True
+    for k in range(10):
+        st = core.load_state()
+        st["speaker"]["eq"]["bands"][0]["gain"] = -24.0 + 2.5 * k
+        core.save_state(st)
+        cycles(pw, 1, rt)
+    check(pw.node_by_name(conduit_eq.node_names("speaker")[0]) == ein, "a long drag doesn't restart the helper")
+    # ...but values that never show up while unchanged do, eventually
+    cycles(pw, 8, rt)
+    ein_r = pw.node_by_name(conduit_eq.node_names("speaker")[0])
+    check(ein_r is not None and ein_r != ein, "a PipeWire that ignores live updates gets a restart with the values baked in")
+    st = core.load_state()
+    st["speaker"]["eq"]["bands"][0]["gain"] = 3.0
+    core.save_state(st)
+    cycles(pw, 10, rt)
+    check(pw.node_by_name(conduit_eq.node_names("speaker")[0]) == ein_r, "...only once: later edits are pushed without restarts")
+    pw.ignore_set_param = False
+    rt.eq.blind.clear()
+    cycles(pw, 2, rt)
+    ein = pw.node_by_name(conduit_eq.node_names("speaker")[0])
+    st = core.load_state()
+    st["speaker"]["eq"]["bands"][0].update(freq=2500.0, gain=-6.0)
+    core.save_state(st)
+    cycles(pw, 2, rt)
     # structural change -> restart
     st = core.load_state()
     st["speaker"]["eq"]["bands"].append({"type": "highpass", "freq": 80, "q": 0.7, "gain": 0, "enabled": True})

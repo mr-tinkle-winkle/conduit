@@ -126,7 +126,8 @@ class FakePipeWire:
             elif cmd[1] == "set-param":
                 nid = int(cmd[2])
                 toks = re.findall(r'"([^"]+)"\s+(-?[0-9.]+)', cmd[4])
-                self.controls.setdefault(nid, {}).update({k: float(v) for k, v in toks})
+                if not getattr(self, "ignore_set_param", False):      # a PipeWire that never applies it
+                    self.controls.setdefault(nid, {}).update({k: float(v) for k, v in toks})
             return _Result()
         if cmd[0] == "wpctl":
             if cmd[1] == "set-volume":

@@ -224,7 +224,40 @@ check(not mgr.is_on(core.HUB_MIC) and spawned[-1].killed, "unticking it stops th
 dlg2.close()
 d2 = conduit_eqview.EqDialog(c, "speaker", w, live=False); QTest.qWait(20)
 check(not d2.listen.isEnabled(), "Listen is disabled in the Virtual Speaker's EQ"); d2.close()
+# a restarted device (same name, new node) gets a fresh loopback
+mgr.toggle(core.HUB_MIC, True); first = spawned[-1]
+pw.remove_node(vm.id)
+new_vm = pw.add_node(vm.name, "Conduit Virtual Mic", "Audio/Source/Virtual", ins=["FL", "FR"], outs=["FL", "FR"])
+c.set_snapshot(core.Snapshot(pw.dump())); QTest.qWait(30)
+check(first.killed and spawned[-1] is not first and spawned[-1].cmd == first.cmd,
+      "Listen follows a device that restarted (new node, same name)")
+mgr.toggle(core.HUB_MIC, False)
 mgr.spawn = mgr._spawn
+
+# the analyser reconnects when its capture ends or its node is replaced
+import sys as _sys
+tap = conduit_eqview.SpectrumTap()
+emit = ("import sys,struct,time\n"
+        "sys.stdout.buffer.write(struct.pack('<512f',*([0.1]*512))); sys.stdout.flush(); time.sleep(0.3)")
+launches = []
+def fake_cmds():
+    tap._cmds = [[_sys.executable, "-c", emit]]
+    launches.append(tap._target)
+tap._make_cmds = fake_cmds
+runs = []
+_orig_launch = tap._launch
+tap._launch = lambda: (runs.append(1), _orig_launch())
+tap.start("conduit_eq_speaker_out", False, 101)
+QTest.qWait(250)
+check(tap.status == "live", f"analyser live ({tap.status})")
+QTest.qWait(1800)
+check(len(runs) >= 2, f"analyser relaunches after its capture ended ({len(runs)} launches)")
+n0 = len(launches)
+tap.start("conduit_eq_speaker_out", False, 102)
+check(len(launches) == n0 + 1 and tap._target[2] == 102, "a new node id (helper restarted) means a new capture")
+tap.start("conduit_eq_speaker_out", False, 102)
+check(len(launches) == n0 + 1, "...but the same node isn't recaptured")
+tap.stop()
 
 # ---- mixing desk
 w = w.set_theme("desk"); QTest.qWait(200)

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 import struct
+import time
 
 from PySide6.QtCore import QPointF, QProcess, QRectF, Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
@@ -93,6 +94,10 @@ class SpectrumTap(QObject):
         self._cmds = []
         self._target = None
         self._got_data = False
+        self._ever = False                 # this target has delivered audio before
+        self._fails = 0
+        self._cmd = None
+        self._last_data = 0.0
         self._timer = QTimer(self)
         self._timer.setInterval(40)
         self._timer.timeout.connect(self._analyse)
@@ -103,11 +108,25 @@ class SpectrumTap(QObject):
             hi = edges[i + 1] * FFT_N / RATE
             self._ranges.append((lo, hi))
 
-    def start(self, node_name: str, is_sink: bool):
-        if self._target == (node_name, is_sink) and self._proc is not None:
+    STALL_S = 2.5          # running but no audio for this long: reconnect
+
+    def start(self, node_name: str, is_sink: bool, node_id=None):
+        """Capture `node_name`.  `node_id` makes a restarted node (same name, new id -- e.g. an
+        equaliser helper that was restarted) count as a new target: the old capture stream
+        doesn't follow it (node.dont-reconnect), so it is replaced."""
+        if self._target == (node_name, is_sink, node_id) and self._proc is not None:
             return
         self.stop()
-        self._target = (node_name, is_sink)
+        self._target = (node_name, is_sink, node_id)
+        self._ever = False
+        self._fails = 0
+        self._make_cmds()
+        self.status = "starting"
+        self._launch()
+        self._timer.start()
+
+    def _make_cmds(self):
+        node_name, is_sink, _nid = self._target
         props = ('{ node.name = "conduit_spectrum" node.description = "Conduit Analyser" '
                  'application.name = "Conduit Analyser" node.dont-reconnect = true '
                  f'stream.capture.sink = {"true" if is_sink else "false"} }}')
@@ -118,9 +137,6 @@ class SpectrumTap(QObject):
              f"--rate={RATE}", "--channels=1", "--raw", "--latency-msec=30",
              "--client-name=Conduit Analyser", "--property=node.name=conduit_spectrum"],
         ]
-        self.status = "starting"
-        self._launch()
-        self._timer.start()
 
     def _launch(self):
         if not self._cmds:
@@ -130,6 +146,8 @@ class SpectrumTap(QObject):
             return
         cmd = self._cmds.pop(0)
         self._got_data = False
+        self._last_data = time.monotonic()
+        self._cmd = cmd
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.SeparateChannels)
         proc.readyReadStandardOutput.connect(self._read)
@@ -143,18 +161,48 @@ class SpectrumTap(QObject):
             return
         self._proc = None
         proc.deleteLater()
-        if self._target is not None and not self._got_data:
+        if self._target is not None and not self._got_data and not self._ever:
             self._launch()                 # this tool didn't work here: try the next one
         elif self._target is not None:
-            self.status = "off"
+            # it worked and then stopped (the node went away / restarted): same tool again shortly
+            self._cmds = [self._cmd]
+            self.status = "starting"
             self.updated.emit()
+            self._fails += 1                                  # back off if it keeps failing
+            QTimer.singleShot(min(5000, 300 * 2 ** min(self._fails, 5)), self._relaunch)
+
+    def _relaunch(self):
+        if self._target is not None and self._proc is None:
+            if not self._cmds:
+                self._make_cmds()
+            self._launch()
+
+    def _watchdog(self):
+        """A capture that went quiet without exiting (its node was replaced under it): restart."""
+        if self._proc is None or self._target is None or not self._got_data:
+            return
+        if time.monotonic() - self._last_data > self.STALL_S:
+            cmd = self._cmd
+            proc, self._proc = self._proc, None
+            try:
+                proc.finished.disconnect()
+                proc.errorOccurred.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            proc.kill()
+            proc.waitForFinished(300)
+            proc.deleteLater()
+            self._cmds = [cmd]
+            self._launch()
 
     def _read(self):
         if self._proc is None:
             return
         data = bytes(self._proc.readAllStandardOutput())
         if data:
-            self._got_data = True
+            self._got_data = self._ever = True
+            self._fails = 0
+            self._last_data = time.monotonic()
             self.status = "live"
             self._buf += data
             keep = FFT_N * 4 * 2
@@ -179,6 +227,7 @@ class SpectrumTap(QObject):
         self.status = "live"
 
     def _analyse(self):
+        self._watchdog()
         n = FFT_N
         usable = len(self._buf) - len(self._buf) % 4
         if usable < n * 4:
@@ -952,7 +1001,7 @@ class EqDialog(kit.ThemedDialog):
             self.tap.stop()
             self._spectrum()
             return
-        self.tap.start(node.name, node.media_class == "Audio/Sink")
+        self.tap.start(node.name, node.media_class == "Audio/Sink", node.id)
 
     def _frame(self):
         """A new analyser frame: smooth it into what the graph shows."""

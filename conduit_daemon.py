@@ -354,38 +354,67 @@ def sync_helpers(state, helpers):
 
 
 class EqControl:
-    """Pushes frequency / Q / gain changes into running equalisers without restarting them."""
-    MAX_TRIES = 4
+    """Pushes frequency / Q / gain changes into running equalisers without restarting them.
+
+    A push takes a moment to show up in pw-dump, and while a handle is being dragged the
+    wanted values change every few hundred ms -- that is not a failed push.  Only values that
+    stay unchanged AND keep not showing up for a while count as "this PipeWire ignores live
+    updates", and only then is the helper restarted with the values baked in (a restart
+    recreates its nodes, which drops anything attached to them, e.g. the GUI's analyser)."""
+    SETTLE_S = 2.0       # how long a push may take to be reported back before it is re-sent
+    MAX_TRIES = 4        # re-sends of the same values before restarting (~8 s of no effect)
 
     def __init__(self):
-        self.sent = {}       # box -> controls last sent (when PipeWire doesn't report them back)
-        self.tries = {}      # box -> consecutive pushes that didn't stick
+        self.sent = {}       # box -> controls last pushed
+        self.sent_at = {}    # box -> when they were pushed
+        self.tries = {}      # box -> re-sends of unchanged values that didn't stick
+        self.blind = set()   # boxes already restarted once for this: push without verifying
 
-    def sync(self, state, snap, helpers):
+    @staticmethod
+    def _close(have, want) -> bool:
+        try:
+            have = float(have)
+        except (TypeError, ValueError):
+            return False
+        return abs(have - want) <= 1e-3 + 2e-5 * abs(want)       # PipeWire reports float32
+
+    def _forget(self, box):
+        for d in (self.sent, self.sent_at, self.tries):
+            d.pop(box, None)
+
+    def sync(self, state, snap, helpers, now=None):
+        now = time.monotonic() if now is None else now
         for box in core.all_boxes(state):
             if not core.eq_enabled(state, box):
-                self.sent.pop(box, None)
-                self.tries.pop(box, None)
+                self._forget(box)
                 continue
             ein, eout = core.eq_nodes(state, box, snap)
             if ein is None:
                 continue
             want = conduit_eq.controls(core.eq_config(state, box))
             carrier = next((n for n in (ein, eout) if n.controls and "eq_pre:Gain" in n.controls), None)
+            if box in self.blind:
+                carrier = None       # this PipeWire doesn't report pushes back: never restart again
             if carrier is not None:
-                diff = {k: v for k, v in want.items() if abs(float(carrier.controls.get(k, 1e9)) - v) > 1e-3}
+                diff = {k: v for k, v in want.items() if not self._close(carrier.controls.get(k), v)}
                 if not diff:
                     self.tries.pop(box, None)
-                    continue
-                self.tries[box] = self.tries.get(box, 0) + 1
-                if self.tries[box] > self.MAX_TRIES:
-                    # the live push isn't sticking on this PipeWire: restart with the values baked in
-                    log(f"equaliser {box!r}: live update didn't apply, restarting helper")
-                    helpers.stop(f"eq:{box}")
-                    helpers.last_start.pop(f"eq:{box}", None)
-                    self.tries.pop(box, None)
+                    self.sent[box] = want
                     continue
                 target = carrier
+                if self.sent.get(box) == want:
+                    if now - self.sent_at.get(box, now) < self.SETTLE_S:
+                        continue                          # just pushed: give it time to show up
+                    self.tries[box] = self.tries.get(box, 0) + 1
+                    if self.tries[box] > self.MAX_TRIES:
+                        log(f"equaliser {box!r}: live update didn't apply, restarting helper")
+                        helpers.stop(f"eq:{box}")
+                        helpers.last_start.pop(f"eq:{box}", None)
+                        self._forget(box)
+                        self.blind.add(box)
+                        continue
+                else:
+                    self.tries.pop(box, None)             # new values (a drag in progress): fresh push
             else:
                 if self.sent.get(box) == want:
                     continue
@@ -394,6 +423,7 @@ class EqControl:
             if r.returncode != 0:
                 log(f"equaliser {box!r}: set-param failed: {r.stderr.strip()}")
             self.sent[box] = want
+            self.sent_at[box] = now
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +646,7 @@ def run_cycle(state, snap, rt, slow=True, now=None):
     sync_helpers(state, rt.helpers)
     plan = core.compute_plan(state, snap)
     reconcile(plan, snap)
-    rt.eq.sync(state, snap, rt.helpers)
+    rt.eq.sync(state, snap, rt.helpers, now)
     enforce_defaults(snap, plan.mic_default, slow)
     enforce_master_controls(state, snap, rt.applied, slow)
     fired = rt.events.step(state, snap, now)

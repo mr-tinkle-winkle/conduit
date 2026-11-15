@@ -5,8 +5,9 @@ One `pw-loopback` per listened device, owned by the GUI and gone when Conduit cl
 monitoring aid, not routing, so it is never saved to state.json).  The loopback's nodes are
 named conduit_listen_* so neither the daemon nor the graph treats them as devices to route.
 
-It follows the graph: when the device or the speakers change (or the device appears later)
-the loopback is restarted on the new pair; while the device doesn't exist it just waits.
+It follows the graph: when the device or the speakers change, restart (same name, new node --
+e.g. an equaliser helper) or appear later, the loopback is restarted on the new pair; while the
+device doesn't exist it just waits.
 """
 from __future__ import annotations
 
@@ -82,7 +83,10 @@ class ListenManager(QObject):
         for key in self.want:
             src = core.listen_source(st, key, snap)
             sink = core.listen_sink(st, snap)
-            route = (src.name, sink.name) if src is not None and sink is not None and src.id != sink.id else None
+            # ids too: a device that restarts keeps its name but gets a new node, and the loopback
+            # (node.dont-reconnect) would otherwise sit on the dead one, silent
+            route = ((src.name, src.id, sink.name, sink.id)
+                     if src is not None and sink is not None and src.id != sink.id else None)
             cur = self.procs.get(key)
             if cur is not None and cur[1] == route:
                 continue
