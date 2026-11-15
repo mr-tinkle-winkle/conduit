@@ -23,6 +23,7 @@ import conduit_dialogs as dlg
 from conduit_header import BoxHeader
 
 PLACEHOLDER = "Add a device or app…"
+HUB_ITEM = "\x00hub:"          # combo data prefix for another box's hub (vs. a device label)
 
 
 def _rows(chans):
@@ -39,6 +40,29 @@ def box_hubs(state, box, side):
     if side == "in":
         return [core.hub_custom(cid)]
     return [core.hub_custom(cid), core.hub_custom_mic(cid), core.ns_cell_id(box)]
+
+
+def box_endpoint(state, box, side):
+    """The hub another box links to when this box is added to it: its input hub when it
+    consumes ("in"), its last output stage (noise suppression if on) when it produces ("out")."""
+    if side == "in":
+        return box_hubs(state, box, "in")[0]
+    if core.ns_method(state, box) in core.NOISE_SUPPRESSION_METHODS:
+        return core.ns_cell_id(box)
+    return box_hubs(state, box, "out")[0]
+
+
+def other_box_items(state, box, side):
+    """[(text, data)] for the other boxes (Speaker, Microphone, Custom Conduits) this section can
+    link to: Outputs offer their inputs, Inputs offer their outputs."""
+    dev_side = "out" if side == "in" else "in"
+    out = []
+    for other in core.all_boxes(state):
+        if other == box:
+            continue
+        hub = box_endpoint(state, other, dev_side)
+        out.append((f"{core.hub_display_name(state, hub)}  ({core.box_label(state, other)})", HUB_ITEM + hub))
+    return out
 
 
 def section_rows(state, box, side):
@@ -233,7 +257,8 @@ class Section(QWidget):
                 continue
             if rec.get(dev_side):
                 closed.append(label)
-        items = [(PLACEHOLDER, None)] + [(l, l) for l in live] + [(f"{l}  (closed)", l) for l in closed]
+        hubs = [(t, d) for t, d in other_box_items(st, self.box, self.side) if d[len(HUB_ITEM):] not in self.rows]
+        items = ([(PLACEHOLDER, None)] + hubs + [(l, l) for l in live] + [(f"{l}  (closed)", l) for l in closed])
         cur = [(self.combo.itemText(i), self.combo.itemData(i)) for i in range(self.combo.count())]
         if cur == items:
             return
@@ -250,15 +275,18 @@ class Section(QWidget):
         if not label:
             return
         c, st = self.c, self.c.state
-        cell = c.ensure_cell(label, self.box)
+        if label.startswith(HUB_ITEM):
+            endpoint = label[len(HUB_ITEM):]                 # another box's hub: link hub to hub
+        else:
+            endpoint = c.ensure_cell(label, self.box)["id"]
         hub = box_hubs(st, self.box, self.side)[0]
         if self.side == "out" and self.box == "mic" and core.ns_method(st, "mic") in core.NOISE_SUPPRESSION_METHODS:
             hub = core.NS_MIC
-        cp, hp = c.cell_ports(cell["id"]), c.cell_ports(hub)
+        cp, hp = c.cell_ports(endpoint), c.cell_ports(hub)
         if self.side == "in":
-            c.link_cells(cell["id"], _rows(cp["out"] or core.STEREO), hub, _rows(hp["in"]), "*", "*")
+            c.link_cells(endpoint, _rows(cp["out"] or core.STEREO), hub, _rows(hp["in"] or core.STEREO), "*", "*")
         else:
-            c.link_cells(hub, _rows(hp["out"]), cell["id"], _rows(cp["in"] or core.STEREO), "*", "*")
+            c.link_cells(hub, _rows(hp["out"] or core.STEREO), endpoint, _rows(cp["in"] or core.STEREO), "*", "*")
         QTimer.singleShot(0, c.commit)
 
 

@@ -227,6 +227,30 @@ check(len(c.state["links"]) == n_links - 2 and core.cell_by_id(c.state, chrome["
 check(core.cell_by_id(c.state, cid)["events"], "events untouched by list edits")
 check(any(l.get("anti") for l in c.state["links"]), "bypass anti-link untouched by list edits")
 
+# 15b. conduits can be added to each other from the list (hub to hub)
+gbox = core.all_boxes(c.state)[2]
+gid = gbox.split(".")[1]
+gout = le.panels[gbox].outputs
+datas = [gout.combo.itemData(i) for i in range(gout.combo.count())]
+check(any(d and d.endswith(core.HUB_SPEAKER) for d in datas) and any(d and d.endswith(core.HUB_MIC) for d in datas),
+      f"a Custom Conduit's Output offers the Speaker and Microphone ({[gout.combo.itemText(i) for i in range(gout.combo.count())][:4]})")
+sout = le.panels["speaker"].outputs
+sdatas = [sout.combo.itemData(i) for i in range(sout.combo.count())]
+check(any(d and d.endswith(core.hub_custom(gid)) for d in sdatas), "the Speaker's Output offers the Custom Conduit")
+mout = le.panels["mic"].outputs
+check(core.hub_custom(gid) in mout.rows or
+      any(d and d.endswith(core.hub_custom(gid)) for d in (mout.combo.itemData(i) for i in range(mout.combo.count()))),
+      "the Microphone's Output offers the Custom Conduit (or already lists it)")
+gout._add(next(i for i, d in enumerate(datas) if d and d.endswith(core.HUB_SPEAKER))); QTest.qWait(80)
+hl = [l for l in c.state["links"] if l["src"] == core.hub_custom(gid) and l["dst"] == core.HUB_SPEAKER]
+check(len(hl) == 2 and core.HUB_SPEAKER in gout.rows, "adding it links the conduit's hub to the Virtual Speaker (L and R)")
+check(not any((gout.combo.itemData(i) or "").endswith(core.HUB_SPEAKER) for i in range(gout.combo.count())),
+      "...and it leaves the dropdown")
+check(core.hub_custom(gid) in le.panels["speaker"].inputs.rows, "it shows as an Input of the Speaker")
+gout.rows[core.HUB_SPEAKER]._remove(); QTest.qWait(50)
+check(not [l for l in c.state["links"] if l["src"] == core.hub_custom(gid) and l["dst"] == core.HUB_SPEAKER],
+      "✕ removes the hub-to-hub links again")
+
 # 16. unmanaged toggle produces ghosts
 w.mode_group.button(0).click(); QTest.qWait(200)
 w.unmanaged.setChecked(True); QTest.qWait(100)

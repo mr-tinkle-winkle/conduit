@@ -29,7 +29,7 @@ let
 in
 stdenvNoCC.mkDerivation {
   pname = "conduit";
-  version = "2.3.1";
+  version = "2.3.2";
   inherit src;
   nativeBuildInputs = [ makeWrapper imagemagick ];
   dontBuild = true;

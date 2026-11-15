@@ -139,6 +139,15 @@ def test_daemon_routing():
     check(links_between(pw, ids["p4"], base) == [], "blocked (disabled) entry not linked")
     check(links_between(pw, ids["vspk"], ids["vencord"]) == [("FL", "FL"), ("FR", "FR")], "vspk -> vencord")
     check(links_between(pw, ids["vmic"], ids["obs"]) == [("FL", "FL"), ("FR", "FR")], "unmanaged WirePlumber link left alone")
+    # hub to hub (the List editor's "Virtual Speaker (Speaker)" entry in a conduit's Output)
+    st = core.load_state()
+    for ch in ("FL", "FR"):
+        core.new_link(st, core.hub_custom("1"), ch, core.HUB_SPEAKER, ch)
+        core.new_link(st, core.HUB_SPEAKER, ch, core.hub_custom("1"), ch)
+    core.save_state(st)
+    cycles(pw, 3)
+    check(links_between(pw, base, ids["vspk"]) == [("FL", "FL"), ("FR", "FR")], "custom conduit hub -> Virtual Speaker")
+    check(links_between(pw, ids["vspk"], base) == [("FL", "FL"), ("FR", "FR")], "Virtual Speaker -> custom conduit hub")
 
 
 def test_per_port_and_blocks():
