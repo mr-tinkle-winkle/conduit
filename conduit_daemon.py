@@ -624,6 +624,7 @@ class EventEngine:
 class Runtime:
     def __init__(self):
         self.loops = set()
+        self.helper_epoch = None
         self.events = EventEngine()
         self.helpers = Helpers()
         self.applied = Applied()
@@ -638,6 +639,13 @@ def print_inventory(snap):
             f"client_id={n.client_id} state={n.state})")
 
 
+def _was_linked(state, snap, l) -> bool:
+    """Is the configured link `l` (now refused as a loop) currently live in the graph?"""
+    srcs = {n.id for n in core.cell_nodes(state, l["src"], "out", snap)}
+    dsts = {n.id for n in core.cell_nodes(state, l["dst"], "in", snap)}
+    return any(snap.port_owner.get(o) in srcs and snap.port_owner.get(i) in dsts for o, i in snap.links)
+
+
 def run_cycle(state, snap, rt, slow=True, now=None):
     """One reconcile pass.  Returns True when an event changed the config (so the caller
     should run another pass right away)."""
@@ -646,14 +654,31 @@ def run_cycle(state, snap, rt, slow=True, now=None):
     sync_gain_nodes(core.gain_specs(state), snap, rt.applied, slow)
     sync_helpers(state, rt.helpers)
     plan = core.compute_plan(state, snap)
+    flush = False
+    epoch = state.get("daemon", {}).get("restart_helpers", 0)
+    if rt.helper_epoch is None:
+        rt.helper_epoch = epoch
+    elif epoch != rt.helper_epoch:
+        rt.helper_epoch = epoch
+        log("restarting EQ / noise suppression helpers (asked by the GUI)")
+        flush = True
     if plan.loops != rt.loops:
         for lid in sorted(plan.loops - rt.loops):
             l = core.link_by_id(state, lid)
             if l is not None:
                 log(f"not linking {core.cell_label(state, l['src'])} -> {core.cell_label(state, l['dst'])}: "
                     "it would close a feedback loop (constant buzz)")
+                flush = flush or _was_linked(state, snap, l)
         rt.loops = set(plan.loops)
     reconcile(plan, snap)
+    if flush:
+        # The loop was live before we cut it.  Audio that went round it can blow up to inf /
+        # NaN, and a biquad (equaliser) or RNNoise that has swallowed a NaN outputs silence
+        # forever -- restart the processing helpers so they start from a clean state.
+        for key in list(rt.helpers.procs):
+            log(f"restarting helper {key!r}")
+            rt.helpers.stop(key)
+            rt.helpers.last_start.pop(key, None)
     rt.eq.sync(state, snap, rt.helpers, now)
     enforce_defaults(snap, plan.mic_default, slow)
     enforce_master_controls(state, snap, rt.applied, slow)

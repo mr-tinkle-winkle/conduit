@@ -451,7 +451,30 @@ def test_loop_through_other_apps_loopbacks():
     check(not plan.loops, "(without the modules' link groups there is no visible path -- the groups are what reveal it)")
 
 
+def test_restart_helpers():
+    print("-- restart EQ / NS helpers on request")
+    use_tmp_config()
+    pw, ids = standard_graph()
+    pw.install(core, daemon)
+    st = core.default_state()
+    st["mic"]["eq"] = {"enabled": True, "preamp": 0.0,
+                       "bands": [{"type": "peaking", "freq": 1000, "q": 1.0, "gain": 4.0, "enabled": True}]}
+    core.save_state(st)
+    rt = cycles(pw, 4)
+    ein = pw.node_by_name(conduit_eq.node_names("mic")[0])
+    check(ein is not None, "mic EQ running")
+    st = core.load_state()
+    st["daemon"]["restart_helpers"] = 1
+    core.save_state(st)
+    cycles(pw, 3, rt)
+    ein2 = pw.node_by_name(conduit_eq.node_names("mic")[0])
+    check(ein2 is not None and ein2 != ein, "bumping daemon.restart_helpers restarts the helpers")
+    cycles(pw, 3, rt)
+    check(pw.node_by_name(conduit_eq.node_names("mic")[0]) == ein2, "...once")
+
+
 if __name__ == "__main__":
+    test_restart_helpers()
     test_loop_through_other_apps_loopbacks()
     test_gain_prunes_direct_path()
     test_equaliser()

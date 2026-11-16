@@ -1566,6 +1566,9 @@ class GraphEditor(QWidget):
             menu.addAction("Equaliser…" + ("  ●" if core.eq_enabled(st, it.box) else ""),
                            lambda: QTimer.singleShot(0, lambda: self._open_eq(it.box)))
             self._listen_action(menu, it.cell_id)
+            if core.eq_enabled(st, it.box) or core.ns_method(st, it.box) in core.NOISE_SUPPRESSION_METHODS:
+                menu.addAction("Restart EQ / Noise Suppression", self.restart_helpers).setToolTip(
+                    "Restart the processing if it went silent (e.g. after a feedback loop)")
             if core.box_is_microphone(st, it.box):
                 menu.addSeparator()
                 cur = core.ns_method(st, it.box)
@@ -1604,6 +1607,13 @@ class GraphEditor(QWidget):
         menu.addSeparator()
         menu.addAction("Delete", lambda: self._delete_cell(cid))
         self._exec_menu(menu, gpos)
+
+    def restart_helpers(self):
+        """Ask the daemon to restart every EQ / noise-suppression helper (a filter that swallowed
+        a NaN -- e.g. from a feedback loop -- stays silent until it is restarted)."""
+        d = self.c.state.setdefault("daemon", dict(core.DEFAULT_DAEMON))
+        d["restart_helpers"] = int(d.get("restart_helpers", 0)) + 1
+        self.c.commit()
 
     def _sync_listening(self, repaint=True):
         mgr = conduit_listen.manager(self.c)

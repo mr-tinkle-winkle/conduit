@@ -370,7 +370,7 @@ check(c.state["mic"]["muted"], "desk: master MUTE mutes the device")
 
 # ---- polling rate
 c.state["daemon"].update(instant=False, poll_ms=250); c.commit(); QTest.qWait(50)
-check(json.loads(core.STATE_FILE.read_text())["daemon"] == {"instant": False, "poll_ms": 250} and "250 ms" in w.poll_btn.text(),
+check({k: v for k, v in json.loads(core.STATE_FILE.read_text())["daemon"].items() if k != "restart_helpers"} == {"instant": False, "poll_ms": 250} and "250 ms" in w.poll_btn.text(),
       f"polling rate saved and shown ({w.poll_btn.text()})")
 check(core.normalize({"version": 2, "daemon": {"poll_ms": 1}})["daemon"]["poll_ms"] == core.POLL_MIN_MS, "polling rate is clamped")
 check(not ERRORS, f"no exceptions overall {ERRORS[:1]}")

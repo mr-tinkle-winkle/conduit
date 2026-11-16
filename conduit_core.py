@@ -139,7 +139,7 @@ _CHANNEL_INDEX = {"FL": 0, "FR": 1, "FC": 2, "LFE": 3, "RL": 4, "RR": 5, "SL": 6
 # How quickly the daemon notices new audio things.
 #   instant  react to PipeWire's own change events (a new stream is linked within a few tens of ms)
 #   poll_ms  how often it ALSO re-checks on a timer -- the only mechanism when instant is off
-DEFAULT_DAEMON = {"instant": True, "poll_ms": 2000}
+DEFAULT_DAEMON = {"instant": True, "poll_ms": 2000, "restart_helpers": 0}   # bump to restart EQ / NS
 POLL_CHOICES_MS = (100, 250, 500, 1000, 2000, 5000)
 POLL_MIN_MS, POLL_MAX_MS = 50, 60000
 
@@ -150,6 +150,10 @@ def _norm_daemon(raw) -> dict:
         out["instant"] = bool(raw.get("instant", True))
         try:
             out["poll_ms"] = int(max(POLL_MIN_MS, min(POLL_MAX_MS, float(raw.get("poll_ms", 2000)))))
+        except (TypeError, ValueError):
+            pass
+        try:
+            out["restart_helpers"] = int(raw.get("restart_helpers", 0))
         except (TypeError, ValueError):
             pass
     return out
