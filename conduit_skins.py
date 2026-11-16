@@ -157,13 +157,17 @@ class RackSkin(Skin):
         p.drawArc(QRectF(pivot.x() - rad, pivot.y() - rad, 2 * rad, 2 * rad), 40 * 16, 100 * 16)
         p.setPen(QPen(QColor("#c63a2b"), 2))
         p.drawArc(QRectF(pivot.x() - rad, pivot.y() - rad, 2 * rad, 2 * rad), 40 * 16, 22 * 16)
-        ang = -42.0
-        if it.signal:
-            t = self.t
-            ang = 2 + 18 * math.sin(t * 5.1) + 9 * math.sin(t * 11.7 + 1) + 5 * math.sin(t * 23.0)
+        ang = -42.0 + 84.0 * self.meter(it, rms=True, floor=-40.0)   # 0 dBFS RMS = pinned right
         a = math.radians(ang)
         p.setPen(QPen(QColor("#1b1b1b"), 1.5))
         p.drawLine(pivot, QPointF(pivot.x() + math.sin(a) * rad, pivot.y() - math.cos(a) * rad))
+
+    def hotspots(self, it):
+        if it.hub or it.ghost or it.is_ns:
+            return []
+        m = self.mid(it)
+        cx, cy = m.center().x(), m.center().y() + 5
+        return [(QRectF(cx - 42, cy - 10, 86, 20), "block", "Switch this device on / off (block)")]
 
     def _toggle(self, p, m, it):
         cx, cy = m.center().x(), m.center().y() + 5
@@ -358,8 +362,15 @@ class ScopeSkin(Skin):
         elif it.status == "closed":
             text(p, m, "NO SIGNAL", sf, alpha(col, 160), C)
         elif it.signal:
-            db = -12 + 4 * math.sin(self.t * 3.1 + it.index) + 2 * math.sin(self.t * 7.3)
-            self._glow_text(p, m, f"▲ {db:+.0f} dB", sf, col, C)
+            db = self.meter_db(it)
+            if db is None and getattr(it, "meter_fake", False):
+                db = -12 + 4 * math.sin(self.t * 3.1 + it.index) + 2 * math.sin(self.t * 7.3)
+            if db is None:
+                self._glow_text(p, m, "▲ ...", sf, col, C)
+            elif db <= -60:
+                self._glow_text(p, m, "▲ -inf dB", sf, alpha(col, 160), C)
+            else:
+                self._glow_text(p, m, f"▲ {db:+.0f} dB", sf, col, C)
         else:
             text(p, m, "- - -", sf, alpha(col, 120), C)
 
@@ -678,6 +689,12 @@ class SchematicSkin(Skin):
         else:
             text(p, m, "FILTER" if it.is_ns else ("SRC" if it.outs else "LOAD"), F(self.MONO, 9), alpha(ink, 170), C)
 
+    def hotspots(self, it):
+        if it.status != "blocked" or it.ghost:
+            return []
+        m = self.mid(it)
+        return [(QRectF(m.center().x() - 34, m.top(), 68, m.height()), "block", "Close the switch (unblock)")]
+
     def _switch(self, p, m, it):
         c = m.center()
         age = it.fx("block")
@@ -850,13 +867,25 @@ class TuiSkin(Skin):
         else:
             text(p, r1, "● live" if it.signal else "○ idle", f, "#98c379" if it.signal else self.DIM, C)
             if it.signal:
-                glyphs = "▁▂▃▄▅▆▇"
-                step = int(self.t * 9)
-                s = "".join(glyphs[_hash2(step + i * 7, it.index + i) % len(glyphs)] for i in range(7))
-                text(p, r2, s, f, "#98c379", C)
+                lv = self.meter(it)
+                cells, eighths = 9, " ▏▎▍▌▋▊▉█"
+                fill = lv * cells
+                bar = ""
+                for i in range(cells):
+                    part = max(0.0, min(1.0, fill - i))
+                    bar += eighths[int(part * 8)]
+                db = self.meter_db(it)
+                tail = "" if db is None else (" -inf" if db <= -60 else f" {db:+.0f}")
+                text(p, r2, f"▕{bar}▏{tail}", f, "#e06c75" if lv > 0.95 else "#98c379", C)
             else:
                 text(p, r2, "mix bus" if it.hub and not it.is_ns else "denoise" if it.is_ns else "stereo" if len(it.ins or it.outs) > 1 else "mono",
                      f, self.DIM, C)
+
+    def hotspots(self, it):
+        if it.status != "blocked" or it.ghost:
+            return []
+        m = self.mid(it)
+        return [(QRectF(m.left(), m.top(), m.width(), min(32.0, m.height())), "block", "Unblock (F9)")]
 
     def paint_port(self, p, it, side, ch, rect, hovered):
         r = QRectF(rect.left() + (4 if side == "in" else PORT_W - 28), rect.top(), 24, rect.height())
@@ -1018,7 +1047,8 @@ class GlassSkin(Skin):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#a7f3d0"))
             for i in range(4):
-                hh = 3 + 8 * abs(math.sin(self.t * (4.5 + i * 0.9) + i * 1.3 + it.index))
+                lv = self.meter(it)
+                hh = 2 + 9 * lv * (0.55 + 0.45 * abs(math.sin(self.t * (4.5 + i * 0.9) + i * 1.3 + it.index)))
                 p.drawRoundedRect(QRectF(x0 + i * 4, m.center().y() + 5 - hh, 2.6, hh), 1.2, 1.2)
             p.setBrush(Qt.NoBrush)
             text(p, QRectF(x0 + 20, m.top(), sw + 4, m.height()), sub, sf, alpha("#ffffff", 190), fit=False)
@@ -1280,9 +1310,14 @@ class DeskSkin(Skin):
         self.dot_grid(p, rect, QColor(255, 255, 255, 10), 32)
 
     def level(self, seed, t) -> float:
-        """A plausible bouncing level, 0..1 (activity, not a measurement)."""
-        return max(0.0, min(1.0, 0.55 + 0.22 * math.sin(t * 6.1 + seed) + 0.14 * math.sin(t * 13.7 + seed * 2.1)
-                            + 0.09 * math.sin(t * 29.3 + seed * 0.7)))
+        """The fallback bounce (the Mixing Desk view's meters when metering is unavailable)."""
+        return self.bounce(seed, t)
+
+    def hotspots(self, it):
+        if it.hub or it.ghost:
+            return []
+        m = self.mid(it)
+        return [(QRectF(m.center().x() - 22, m.top() + 14, 44, 13), "block", "Mute (block) this device")]
 
     def paint_body(self, p, it):
         b = self.body(it)
@@ -1320,7 +1355,7 @@ class DeskSkin(Skin):
         m = self.mid(it)
         segs = 10
         sw = (m.width() - 8) / segs
-        lit = int(self.level(it.index * 1.7, self.t) * segs + 0.5) if it.signal else 0
+        lit = int(self.meter(it) * segs + 0.5)
         y = m.top() + 3
         for i in range(segs):
             on = i < lit
@@ -1488,7 +1523,7 @@ class SketchSkin(Skin):
                 path = partial(path, age / 0.65, 60)
             stroke(p, path, QColor(self.RED), 3)
         if it.signal and not it.hub:
-            wig = 5 * math.sin(self.t * 9 + it.index)
+            wig = (1 + 8 * self.meter(it)) * math.sin(self.t * 9 + it.index)
             p.save()
             p.translate(CELL_W + 6, b.height() / 2)
             p.rotate(wig)
@@ -1697,7 +1732,7 @@ class ArcadeSkin(Skin):
             text(p, QRectF(CELL_W - bw - 8, 3, bw, HEADER_H - 4), badge, f, col, R_ | V, fit=False)
         m = self.mid(it)
         name = "core" if it.hub else "spk" if it.speaker else "mic" if (it.box == "mic" and it.outs) else "note"
-        bob = -3 if (it.signal and int(self.t * 4) % 2 == 0) else 0
+        bob = -round(4 * self.meter(it)) if it.signal else 0
         sx, sy = m.left() + 2, m.center().y() - 10 + bob
         self._sprite(p, name, sx, sy, col)
         word = self.status_word(it, "LV3 ON", "IDLE", "STUN", "ZZZ")

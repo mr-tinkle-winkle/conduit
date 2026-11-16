@@ -359,6 +359,21 @@ The window is a response graph, 20 Hz – 20 kHz against gain in dB:
   the harder it is working
 - **Listen** plays the device through your speakers while you tune it
 
+### Meters and controls on the graph
+
+The themes' meters show real levels: Patch Rack's VU needles (RMS) and
+LED strips, the Oscilloscope's dB readouts, the terminal's bar meters,
+Frosted Glass's bars, the Mixing Desk's strips. Every device carrying
+audio gets a tiny `pw-record` capture (`conduit_meter_*`, mono 12 kHz)
+linked to it with *passive* links, so a meter never keeps a device
+awake; meters stop a few seconds after a device goes quiet, and nothing
+is metered while the graph isn't shown or Animations are off.
+
+Controls a theme draws on a cell work: Patch Rack's ON/OFF toggle,
+the Mixing Desk theme's MUTE buttons, the Schematic's open switch and
+the terminal's [BLOCKED] line all block / unblock the device when
+clicked (the pointer turns into a hand over them).
+
 ### Listen to this Device
 
 Right-click any cell or hub → **Listen to this Device** (or tick
@@ -592,6 +607,7 @@ conduit_skins.py       the ten themes
 conduit_desk.py        the Mixing Desk editor
 conduit_eqview.py      the equaliser window, spectrum analyser and smoothing
 conduit_listen.py      "Listen to this Device" (pw-loopback to the real speakers)
+conduit_meter.py       real levels for the themes' meters (passive pw-record taps)
 conduit_list.py        the list editor
 conduit_header.py      a box's header (shared by the editors)
 conduit_dialogs.py     auto-detect, noise suppression, volume, colour, New Cell, events

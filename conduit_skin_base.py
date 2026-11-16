@@ -356,6 +356,33 @@ class Skin:
     def body(self, it) -> QRectF:
         return QRectF(0, 0, CELL_W, it.height())
 
+    # -- levels (conduit_meter measures them; items carry peak_db / rms_db)
+    @staticmethod
+    def bounce(seed, t) -> float:
+        """A plausible bouncing level, 0..1 -- only used where metering is unavailable."""
+        return max(0.0, min(1.0, 0.55 + 0.22 * math.sin(t * 6.1 + seed) + 0.14 * math.sin(t * 13.7 + seed * 2.1)
+                            + 0.09 * math.sin(t * 29.3 + seed * 0.7)))
+
+    def meter(self, it, rms=False, floor=-60.0) -> float:
+        """0..1 for drawing a meter: the measured peak (or RMS) between `floor` dBFS and 0 dB."""
+        if not it.signal:
+            return 0.0
+        v = getattr(it, "rms_db" if rms else "peak_db", None)
+        if v is not None:
+            return max(0.0, min(1.0, (v - floor) / -floor))
+        if getattr(it, "meter_fake", False):
+            return self.bounce(it.index * 1.7, self.t)
+        return 0.0
+
+    def meter_db(self, it):
+        """The measured peak in dBFS, or None (not metered / not carrying audio)."""
+        return getattr(it, "peak_db", None) if it.signal else None
+
+    def hotspots(self, it) -> list:
+        """[(QRectF in cell coordinates, action, tooltip)] -- the controls a skin draws on a cell
+        that really work when clicked.  Actions: "block" (toggle the cell's block)."""
+        return []
+
     def mid(self, it) -> QRectF:
         """The free area between the two port columns."""
         def edge(chans):

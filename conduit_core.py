@@ -108,7 +108,8 @@ NS_NODE_PREFIX = "conduit_ns_"
 EQ_NODE_PREFIX = conduit_eq.NODE_PREFIX          # conduit_eq_
 SPECTRUM_NODE_PREFIX = "conduit_spectrum"        # the GUI's analyser capture streams
 LISTEN_NODE_PREFIX = "conduit_listen_"           # the GUI's "Listen to this device" loopbacks
-GUI_PREFIXES = (SPECTRUM_NODE_PREFIX, LISTEN_NODE_PREFIX)
+METER_NODE_PREFIX = "conduit_meter_"             # the GUI's level meters
+GUI_PREFIXES = (SPECTRUM_NODE_PREFIX, LISTEN_NODE_PREFIX, METER_NODE_PREFIX)
 OUR_PREFIXES = (CUSTOM_NODE_PREFIX, GAIN_NODE_PREFIX, NS_NODE_PREFIX, EQ_NODE_PREFIX) + GUI_PREFIXES
 OUR_FIXED_NAMES = {VIRTUAL_SPEAKER, VIRTUAL_MIC}
 

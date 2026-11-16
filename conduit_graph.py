@@ -35,6 +35,7 @@ import qt_ui_kit as kit
 
 import conduit_core as core
 import conduit_listen
+import conduit_meter
 import time
 
 import conduit_dialogs as dlg
@@ -75,6 +76,10 @@ class CellItem(QGraphicsObject):
         self.also = ""
         self.speaker = False
         self.listening = False           # "Listen to this device" is on (badge)
+        self._hover_hotspot = False
+        self.peak_db = None              # measured level (conduit_meter), None = not metered
+        self.rms_db = None
+        self.meter_fake = False          # metering unavailable: skins fall back to a bounce
         self.auto_detect = False
         self.events = 0
         self.outcome = None
@@ -189,11 +194,23 @@ class CellItem(QGraphicsObject):
         SK().paint_cell(p, self)
 
     # -- interaction
+    def hotspot_at(self, pos):
+        """The skin control (toggle, switch, MUTE ...) under `pos`, or None."""
+        if self.ghost or self.editor.outcome_box is not None:
+            return None
+        for rect, action, tip in SK().hotspots(self):
+            if rect.contains(pos):
+                return action, tip
+        return None
+
     def hoverMoveEvent(self, e):
         hp = self.port_at(e.pos())
-        if hp != self.hover_port:
+        hs = None if hp else self.hotspot_at(e.pos())
+        self.setToolTip(hs[1] if hs else "")
+        if hp != self.hover_port or (hs is not None) != self._hover_hotspot:
             self.hover_port = hp
-            self.setCursor(Qt.CrossCursor if hp else Qt.ArrowCursor)
+            self._hover_hotspot = hs is not None
+            self.setCursor(Qt.CrossCursor if hp else Qt.PointingHandCursor if hs else Qt.ArrowCursor)
             self.update()
 
     def hoverLeaveEvent(self, e):
@@ -211,6 +228,12 @@ class CellItem(QGraphicsObject):
             if hp is not None and self.editor.outcome_box is None:
                 self._drag_link = True
                 self.editor.begin_link_drag(self, hp[0], hp[1], e.screenPos())
+                e.accept()
+                return
+            hs = self.hotspot_at(e.pos())
+            if hs is not None:
+                self.editor.interacting = False
+                self.editor.cell_action(self, hs[0])
                 e.accept()
                 return
         if e.button() == Qt.LeftButton:
@@ -642,6 +665,7 @@ class GraphEditor(QWidget):
         self._paint_cost = 0.0           # seconds spent painting since the last tick
         self._bg_at = 0.0                # last refresh of an animated background
         self._moving_links: set = set()  # links following a dragged cell (painted uncached)
+        self._metered: set = set()       # cells showing a measured level
         self._overlay_rect = QRectF()    # what the overlay painted last (for partial updates)
         self._anim = QTimer(self)
         self._anim.setInterval(40)
@@ -755,11 +779,18 @@ class GraphEditor(QWidget):
             if abs(want - self._anim.interval()) > 12:
                 self._anim.setInterval(want)
         if not self.isVisible():
+            mm = conduit_meter.manager(self.c)
+            if mm.meters and self._tick_n % 20 == 0:
+                mm.want([])                       # hidden (List / Desk view): let them lapse
             return
         if self._fx:
             now = time.monotonic()
             for k in [k for k, t in self._fx.items() if now - t > 4.0]:
                 del self._fx[k]
+        if self._tick_n % 20 == 0:          # start / stop meters as the window shows or hides
+            self._meter_sync({cid: it for bw in self.box_widgets.values()
+                              for cid, it in bw.view.cells.items() if not cid.startswith("ghost:")})
+        self._meter_poll()
         now = time.monotonic()
         bg = sk.bg_animated and now - self._bg_at > 0.25
         if bg:
@@ -776,6 +807,38 @@ class GraphEditor(QWidget):
             for bw in self.visible_box_widgets():
                 bw.view.resetCachedContent()
                 bw.view.viewport().update()
+
+    # ------------------------------------------------------------ meters
+    def _meter_sync(self, items):
+        """Meter what carries audio (only while animating -- nothing would draw it otherwise)."""
+        mm = conduit_meter.manager(self.c)
+        on = getattr(self, "animations", True) and self.isVisible()
+        mm.want([cid for cid, it in items.items() if it.signal and not it.ghost] if on else [])
+        fake = not mm.available
+        for it in items.values():
+            it.meter_fake = fake
+
+    def _meter_poll(self):
+        mm = conduit_meter.manager(self.c)
+        if not mm.meters and not self._metered:
+            return
+        mm.poll()
+        now_metered = set()
+        for bw in self.box_widgets.values():
+            for cid, it in bw.view.cells.items():
+                lv = mm.levels(cid) if it.signal else None
+                if lv is None:
+                    if it.peak_db is not None:
+                        it.peak_db = it.rms_db = None
+                        it.update()
+                    continue
+                now_metered.add(cid)
+                it.peak_db, it.rms_db = lv
+        self._metered = now_metered
+
+    def meter_levels(self, cell_id):
+        """(peak dB, rms dB) of a cell / hub, or None (for the Mixing Desk)."""
+        return conduit_meter.manager(self.c).levels(cell_id)
 
     def plain_box_label(self, box) -> str:
         return core.box_label(self.c.state, box)
@@ -947,6 +1010,7 @@ class GraphEditor(QWidget):
             self._cell_state[cid] = (blocked, status)
         for cid in [c for c in self._cell_state if c not in items]:
             del self._cell_state[cid]
+        self._meter_sync(items)
         ids = {l["id"] for l in st["links"]}
         for l in st["links"]:
             if l["id"] not in self._known_links and not l.get("blocked"):
@@ -1447,6 +1511,14 @@ class GraphEditor(QWidget):
         if cell is not None:
             cell["blocked"] = not cell.get("blocked", False)
             self.c.commit()
+
+    def cell_action(self, it, action):
+        """A control drawn on a cell by the theme was clicked."""
+        if action == "block" and not it.hub:
+            cell = core.cell_by_id(self.c.state, it.cell_id)
+            if cell is not None:
+                cell["blocked"] = not cell.get("blocked", False)
+                self.c.commit()
 
     def toggle_link_block(self, keys):
         links = [core.link_by_id(self.c.state, k) for k in keys]

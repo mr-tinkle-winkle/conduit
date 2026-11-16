@@ -234,6 +234,91 @@ check(first.killed and spawned[-1] is not first and spawned[-1].cmd == first.cmd
 mgr.toggle(core.HUB_MIC, False)
 mgr.spawn = mgr._spawn
 
+# ---- real meters
+import conduit_meter, array as _array
+w = w.set_theme("rack") or w; QTest.qWait(100)
+g = w.graph
+mm = conduit_meter.manager(c)
+mm.stop_all(); mm.available = True; mm._wants.clear()
+procs, links = {}, []
+class FakeMeterProc:
+    def __init__(self): self.data = b""; self.killed = False
+    def readAllStandardOutput(self): d, self.data = self.data, b""; return d
+    def kill(self): self.killed = True
+def fake_meter_spawn(cmd, meter):
+    pr = FakeMeterProc(); pr.cmd = cmd; procs[meter.key] = pr; return pr
+class R: returncode = 0; stderr = ""
+mm.spawn = fake_meter_spawn
+mm.run = lambda cmd: (links.append(cmd), R())[1]
+items = {cid: it for bw in g.box_widgets.values() for cid, it in bw.view.cells.items() if not cid.startswith("ghost:")}
+live = [cid for cid, it in items.items() if it.signal]
+g._meter_sync(items)
+check(live and set(procs) == set(live) and all("--target" in p.cmd and "0" in p.cmd for p in procs.values()),
+      f"a meter capture per device carrying audio ({len(procs)} of {len(live)})")
+mm._link_pending()
+check(links and all(l[:2] == ["pw-link", "--passive"] and l[3].startswith("conduit_meter_") for l in links),
+      "meters are linked passively (they never keep a device awake)")
+vic = next(cid for cid in live if not core.is_hub(cid))
+it = items[vic]
+src_node, ports = conduit_meter.MeterManager.source_ports(c.state, vic, c.snap)
+check(sorted(int(l[2]) for l in links if l[3] == mm.meters[vic].name + ":input_MONO") == sorted(ports), "linked from the device's own output ports")
+def feed(key, amp, n=600):
+    m = mm.meters[key]
+    procs[key].data = _array.array("f", [amp, -amp] * (n // 2)).tobytes()
+    mm._read(m, procs[key])
+feed(vic, 0.5); mm._last -= 0.04; g._meter_poll()
+check(it.peak_db is not None and abs(it.peak_db - (-6.02)) < 0.2, f"measured peak of a 0.5 signal = -6 dB ({it.peak_db})")
+sk = skins.current()
+check(abs(sk.meter(it) - (60 - 6.02) / 60) < 0.01, "the theme draws the measured level")
+for _ in range(5):
+    mm._last -= 0.1; g._meter_poll()
+check(it.peak_db < -15, f"silence: the peak falls back ({it.peak_db:.1f} dB)")
+hub = next(cid for cid in live if core.is_hub(cid))
+for _ in range(4):
+    feed(hub, 1.0); mm._last -= 0.1; g._meter_poll()
+check(items[hub].rms_db is not None and items[hub].rms_db > -6 and sk.meter(items[hub], rms=True, floor=-40) > 0.8,
+      "the hub's VU needle follows its RMS")
+w.grab()
+old_proc = procs[vic]
+g._meter_sync({k: v for k, v in items.items() if k != vic})
+check(vic in mm.meters, "a meter lingers a moment after its device goes quiet")
+for m in mm.meters.values():
+    m.wanted_at -= 10
+g._meter_sync({k: v for k, v in items.items() if k != vic})
+check(vic not in mm.meters and old_proc.killed, "...then it is stopped")
+mm.stop_all(); mm._wants.clear()
+mm.spawn, mm.run = mm._spawn, (lambda cmd: __import__("subprocess").run(cmd, capture_output=True, text=True, timeout=2))
+
+# ---- controls drawn by a theme work: Patch Rack's ON/OFF toggle
+spots = None
+for cell_it in [x for x in items.values() if not x.hub and not x.ghost and not x.is_ns]:
+    view = next(bw.view for bw in g.box_widgets.values() if cell_it.cell_id in bw.view.cells)
+    view.centerOn(cell_it); QTest.qWait(30)
+    sp = skins.current().hotspots(cell_it)
+    pt = view.mapFromScene(cell_it.mapToScene(sp[0][0].center()))
+    if view.itemAt(pt) is cell_it:          # not covered by an overlapping cell
+        spots = sp
+        break
+check(spots and spots[0][1] == "block", "Patch Rack's toggle is a control")
+was = bool(core.cell_by_id(c.state, cell_it.cell_id).get("blocked"))
+QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier, pt); QTest.qWait(80)
+check(bool(core.cell_by_id(c.state, cell_it.cell_id).get("blocked")) != was, "clicking the toggle blocks the device")
+QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier, pt); QTest.qWait(80)
+check(bool(core.cell_by_id(c.state, cell_it.cell_id).get("blocked")) == was, "...and clicking again unblocks it")
+for key in ("schematic", "tui"):
+    w = w.set_theme(key) or w; QTest.qWait(60)
+    sk = skins.current()
+    fake_blocked = type("I", (), {})()
+    blocked_it = next(x for bw in w.graph.box_widgets.values() for x in bw.view.cells.values() if not x.hub and not x.ghost)
+    st0 = blocked_it.status
+    blocked_it.status = "blocked"
+    check(sk.hotspots(blocked_it) and sk.hotspots(blocked_it)[0][1] == "block", f"{key}: the blocked cell's switch is clickable")
+    blocked_it.status = st0
+w = w.set_theme("desk") or w; QTest.qWait(60)
+cell_it = next(x for bw in w.graph.box_widgets.values() for x in bw.view.cells.values() if not x.hub and not x.ghost)
+check(skins.current().hotspots(cell_it), "desk: the cells' MUTE buttons are clickable")
+w = w.set_theme("studio") or w; QTest.qWait(60)
+
 # the analyser reconnects when its capture ends or its node is replaced
 import sys as _sys
 tap = conduit_eqview.SpectrumTap()

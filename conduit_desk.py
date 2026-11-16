@@ -28,6 +28,7 @@ from PySide6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 import qt_ui_kit as kit
 
 import conduit_core as core
+import conduit_meter
 import conduit_dialogs as dlg
 import conduit_skins as skins
 from conduit_skin_base import F, elide, hseed, text
@@ -47,6 +48,7 @@ class DeskCanvas(QWidget):
         super().__init__()
         self.ed = editor
         self.c = editor.c
+        self.meter_ids = []           # cells / hubs the last frame drew a live meter for
         self.hits = []            # [(QRectF, kind, payload)]
         self.faders = []          # [(QRectF track, kind, id)]
         self._drag = None
@@ -93,6 +95,7 @@ class DeskCanvas(QWidget):
         bg.setColorAt(1, QColor("#17181b"))
         p.fillRect(self.rect(), bg)
         self.hits, self.faders = [], []
+        self.meter_ids = []
         self.setMinimumWidth(self.wanted_width())
         x = 14.0
         h = min(self.height() - TOP - 12, 600)
@@ -127,6 +130,19 @@ class DeskCanvas(QWidget):
              "#1a1000" if on else "#7a7a75", C)
         if kind:
             self.hits.append((QRectF(r), kind, payload, tip))
+
+    def _level(self, cid, signal, seed, t, rms=False):
+        """0..1 for a meter: the measured level (peak, or RMS for the master's second bar); the
+        old bounce only when metering is unavailable on this system."""
+        if not signal:
+            return 0.0
+        self.meter_ids.append(cid)
+        mm = conduit_meter.manager(self.c)
+        lv = mm.levels(cid)
+        if lv is not None:
+            return conduit_meter.norm(lv[1] if rms else lv[0])
+        sk = skins.current()
+        return sk.level(seed, t) if not mm.available and hasattr(sk, "level") else 0.0
 
     def _meter(self, p, r, level):
         p.fillRect(r, QColor("#0b0b0c"))
@@ -219,7 +235,7 @@ class DeskCanvas(QWidget):
         mute = QRectF(r.center().x() - 32, lcd.top() - mute_h - 6, 64, mute_h)
         body = QRectF(r.left() + 6, y + 4, r.width() - 12, mute.top() - y - 10)
         signal = status == "active"
-        level = sk.level(hseed(cid) % 50, t) if signal and hasattr(sk, "level") else 0.0
+        level = self._level(cid, signal, hseed(cid) % 50, t)
         self._meter(p, QRectF(body.left(), body.top(), 12, body.height()), level)
         self._fader(p, QRectF(body.left() + 30, body.top(), body.width() - 30, body.height()), cell.get("volume", 1.0), "cell", cid)
         self._button(p, mute, "MUTE", blocked, "#ff3b30", kind="mute", payload=cid, tip="Block / unblock this device")
@@ -252,7 +268,7 @@ class DeskCanvas(QWidget):
         item = self.ed.graph._item_for(hub) if self.ed.graph is not None else None
         signal = bool(item is not None and item.signal) and enabled and not cfg.get("muted")
         for k in range(2):
-            level = sk.level(hseed(box) % 40 + k * 3.3, t) if signal and hasattr(sk, "level") else 0.0
+            level = self._level(hub, signal, hseed(box) % 40 + k * 3.3, t, rms=k == 1)
             self._meter(p, QRectF(body.left() + k * 15, body.top(), 12, body.height()), level)
         self._fader(p, QRectF(body.left() + 46, body.top(), body.width() - 46, body.height()), cfg.get("volume", 1.0), "hub", box)
         self._button(p, mute, "MUTE", bool(cfg.get("muted")), "#ff3b30", kind="hubmute", payload=box, tip="Mute this device")
@@ -404,9 +420,14 @@ class DeskEditor(QWidget):
         self.c.live_changed.connect(self.canvas.update)
 
     def _tick(self):
+        mm = conduit_meter.manager(self.c)
         if not self.isVisible() or not self.c.layout.ui("animations"):
+            if mm._wants.get("desk"):
+                mm.want([], "desk")
             return
         self.t = time.monotonic() - self._t0
+        mm.want(dict.fromkeys(self.canvas.meter_ids), "desk")
+        mm.poll()
         self.canvas.update()
 
     def new_cell(self):
