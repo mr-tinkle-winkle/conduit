@@ -1307,7 +1307,10 @@ class GraphEditor(QWidget):
             kind = "direct"
         blocked = bool(l.get("blocked"))
         live = not blocked and self.c.link_live(key)
-        if blocked:
+        loop = key in getattr(self.c.plan, "loops", ())
+        if loop:
+            label = "LOOP"                          # refused: it would close a feedback loop
+        if blocked or loop:
             color = sk.col("link_blocked")
         elif not live:
             color = sk.col("link_pending")

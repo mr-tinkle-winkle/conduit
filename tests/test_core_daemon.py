@@ -146,8 +146,19 @@ def test_daemon_routing():
         core.new_link(st, core.HUB_SPEAKER, ch, core.hub_custom("1"), ch)
     core.save_state(st)
     cycles(pw, 3)
-    check(links_between(pw, base, ids["vspk"]) == [("FL", "FL"), ("FR", "FR")], "custom conduit hub -> Virtual Speaker")
-    check(links_between(pw, ids["vspk"], base) == [("FL", "FL"), ("FR", "FR")], "Virtual Speaker -> custom conduit hub")
+    check(links_between(pw, base, ids["vspk"]) == [("FL", "FL"), ("FR", "FR")], "custom conduit hub -> Virtual Speaker (first link wins)")
+    # ...but not both ways round: that's a feedback loop (a constant buzz at rate/quantum Hz)
+    check(links_between(pw, ids["vspk"], base) == [], "the link back (Virtual Speaker -> conduit) is refused: feedback loop")
+    plan = core.compute_plan(core.load_state(), core.Snapshot(pw.dump()))
+    back = [l["id"] for l in core.load_state()["links"] if l["src"] == core.HUB_SPEAKER and l["dst"] == core.hub_custom("1")]
+    check(back and set(back) <= plan.loops, "the plan names the refused links")
+    # a loop through a helper (equaliser) is caught too
+    st = core.load_state()
+    st["links"] = [l for l in st["links"] if l["id"] not in back]
+    core.save_state(st)
+    cycles(pw, 2)
+    plan = core.compute_plan(core.load_state(), core.Snapshot(pw.dump()))
+    check(not plan.loops, "no loop once it's removed")
 
 
 def test_per_port_and_blocks():

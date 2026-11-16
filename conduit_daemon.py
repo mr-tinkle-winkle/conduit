@@ -623,6 +623,7 @@ class EventEngine:
 
 class Runtime:
     def __init__(self):
+        self.loops = set()
         self.events = EventEngine()
         self.helpers = Helpers()
         self.applied = Applied()
@@ -645,6 +646,13 @@ def run_cycle(state, snap, rt, slow=True, now=None):
     sync_gain_nodes(core.gain_specs(state), snap, rt.applied, slow)
     sync_helpers(state, rt.helpers)
     plan = core.compute_plan(state, snap)
+    if plan.loops != rt.loops:
+        for lid in sorted(plan.loops - rt.loops):
+            l = core.link_by_id(state, lid)
+            if l is not None:
+                log(f"not linking {core.cell_label(state, l['src'])} -> {core.cell_label(state, l['dst'])}: "
+                    "it would close a feedback loop (constant buzz)")
+        rt.loops = set(plan.loops)
     reconcile(plan, snap)
     rt.eq.sync(state, snap, rt.helpers, now)
     enforce_defaults(snap, plan.mic_default, slow)

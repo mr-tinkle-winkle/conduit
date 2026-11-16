@@ -137,6 +137,8 @@ class Row(QFrame):
             status = self.section.c.cell_status(self.endpoint)
             if status == "closed":
                 extra.append("closed")
+        if any(k in getattr(self.section.c.plan, "loops", ()) for k in self.link_ids):
+            extra.append("not connected: feedback loop")
         self.label.setText(text + (f"  ·  {', '.join(extra)}" if extra else ""))
         self.label.setToolTip(text)
         for w in (self.enabled, self.vol):

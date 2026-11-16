@@ -1140,6 +1140,7 @@ class Plan:
         self.internal = set()         # {(out_port, in_port)} hub plumbing (ns splice, mic taps)
         self.mic_default = None       # node the system default source should be
         self.gain_nodes = set()       # node ids of our gain nodes
+        self.loops = set()            # link ids not made: they would close a feedback loop
 
 
 def compute_plan(state: dict, snap: Snapshot) -> Plan:
@@ -1244,7 +1245,82 @@ def compute_plan(state: dict, snap: Snapshot) -> Plan:
         plan.desired = {(o, i) for o, i in plan.desired
                         if snap.port_owner.get(o) not in plan.blocked_nodes
                         and snap.port_owner.get(i) not in plan.blocked_nodes}
+    _refuse_loops(state, snap, plan)
     return plan
+
+
+def _helper_edges(state: dict, snap: Snapshot) -> list:
+    """Node pairs connected *inside* a helper process (audio enters one node, leaves the
+    other): equalisers, noise suppressors, Listen loopbacks."""
+    pairs = []
+    for box in all_boxes(state):
+        pairs.append(conduit_eq.node_names(box))
+        for m in NOISE_SUPPRESSION_METHODS:
+            pairs.append(noise_processor_names(box, m))
+    for n in snap.nodes.values():
+        if n.name.startswith(LISTEN_NODE_PREFIX) and n.name.endswith("_in"):
+            pairs.append((n.name, n.name[:-3] + "_out"))
+    out = []
+    for a, b in pairs:
+        na, nb = snap.by_name.get(a), snap.by_name.get(b)
+        if na is not None and nb is not None:
+            out.append((na.id, nb.id))
+    return out
+
+
+def _refuse_loops(state: dict, snap: Snapshot, plan: Plan):
+    """Never close a feedback loop.  Audio that goes round a loop at unity gain never dies
+    away: it piles up into a constant buzz at (sample rate / quantum) Hz -- a steady ~47-60 Hz
+    hum with harmonics.  Every node passes what comes in out again (sinks via their monitor,
+    filters, gain nodes) and helpers join their two nodes, so a link from A to B closes a
+    loop when B already reaches A.  Configured links are added in order; one that would close
+    a loop is left out (plan.loops) and its ports are not linked."""
+    pt = snap.port_owner
+    removed = set(plan.forbidden)
+    for o, i in snap.links:
+        if (pt.get(o), pt.get(i)) in plan.managed_pairs and (o, i) not in plan.desired:
+            removed.add((o, i))                       # the daemon is about to unlink these
+    user_pairs = {pair for path in plan.link_paths.values() for pair in path}
+    adj: dict = {}
+
+    def add(u, v):
+        if u is not None and v is not None and u != v:
+            adj.setdefault(u, set()).add(v)
+
+    for o, i in snap.links:
+        if (o, i) not in removed and (o, i) not in user_pairs:
+            add(pt.get(o), pt.get(i))
+    for o, i in plan.desired:
+        if (o, i) not in user_pairs:
+            add(pt.get(o), pt.get(i))                 # hub plumbing
+    for u, v in _helper_edges(state, snap):
+        add(u, v)
+
+    def reaches(a, b):
+        seen, todo = {a}, [a]
+        while todo:
+            x = todo.pop()
+            if x == b:
+                return True
+            for y in adj.get(x, ()):
+                if y not in seen:
+                    seen.add(y)
+                    todo.append(y)
+        return False
+
+    order = [l["id"] for l in state["links"]]
+    for lid in order:
+        path = [p for p in plan.link_paths.get(lid) or [] if p in plan.desired]
+        if not path:
+            continue
+        edges = {(pt.get(o), pt.get(i)) for o, i in path}
+        if any(u is not None and v is not None and reaches(v, u) for u, v in edges):
+            plan.loops.add(lid)
+            plan.desired -= set(plan.link_paths[lid])
+            plan.link_paths[lid] = []
+            continue
+        for u, v in edges:
+            add(u, v)
 
 
 def link_live(plan: Plan, snap: Snapshot, link_id: str) -> bool:
