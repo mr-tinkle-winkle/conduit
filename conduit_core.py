@@ -752,7 +752,7 @@ def pw_dump(log=print):
 
 class Node:
     __slots__ = ("id", "name", "description", "app_name", "media_class", "client_id", "state",
-                 "output_ports", "input_ports", "volume", "mute", "controls")
+                 "output_ports", "input_ports", "volume", "mute", "controls", "link_group")
 
     def __init__(self, id_, props, state="", params=None):
         self.volume = None            # wpctl-style (cubic) volume, when the dump carries it
@@ -766,6 +766,9 @@ class Node:
         self.app_name = props.get("application.name")
         self.media_class = props.get("media.class", "") or ""
         self.client_id = props.get("client.id")
+        # loopbacks / filter-chains / echo-cancel: the nodes of one module share a link group,
+        # and audio entering one leaves through the other (invisible as a link)
+        self.link_group = props.get("node.link-group") or None
         self.state = state or ""
         self.output_ports = []          # [(port_id, channel)]
         self.input_ports = []
@@ -1251,7 +1254,8 @@ def compute_plan(state: dict, snap: Snapshot) -> Plan:
 
 def _helper_edges(state: dict, snap: Snapshot) -> list:
     """Node pairs connected *inside* a helper process (audio enters one node, leaves the
-    other): equalisers, noise suppressors, Listen loopbacks."""
+    other): equalisers, noise suppressors, Listen loopbacks, and any other app's loopback /
+    filter-chain module (nodes sharing a node.link-group)."""
     pairs = []
     for box in all_boxes(state):
         pairs.append(conduit_eq.node_names(box))
@@ -1265,6 +1269,19 @@ def _helper_edges(state: dict, snap: Snapshot) -> list:
         na, nb = snap.by_name.get(a), snap.by_name.get(b)
         if na is not None and nb is not None:
             out.append((na.id, nb.id))
+    groups: dict = {}
+    for n in snap.nodes.values():
+        if n.link_group and n.media_class.startswith(("Audio", "Stream")) and "Audio" in n.media_class:
+            groups.setdefault(n.link_group, []).append(n)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        for a in members:
+            if not a.input_ports:
+                continue
+            for b in members:
+                if b is not a and b.output_ports:
+                    out.append((a.id, b.id))      # e.g. input.loopback-X -> output.loopback-X
     return out
 
 

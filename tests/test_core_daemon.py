@@ -414,7 +414,45 @@ def test_master_volume_and_cache():
     check(links_between(pw, ids["spotify"], ids["vspk"]) == [("FL", "FL"), ("FR", "FR")], "old id-based link cache can't prune anything")
 
 
+def test_loop_through_other_apps_loopbacks():
+    """Jeeves-style: an app's loopback captures the Conduit mic into its own sink, whose
+    monitor comes back out as a source -- routing that source into the Conduit mic closes a
+    loop that no single link shows (the loopback carries it internally)."""
+    print("-- loops through other apps' loopback modules")
+    pw, ids = standard_graph()
+    def mk(name, cls, ins=(), outs=(), group=None):
+        nid = pw.add_node(name, name, cls, ins=ins, outs=outs)
+        if group:
+            pw.nodes[nid]["props"]["node.link-group"] = group
+        return nid
+    def port(nid, d, ch):
+        return next(p for p, v in pw.ports.items() if v["node"] == nid and v["dir"] == d and v["channel"] == ch)
+    lb_in = mk("input.loopback-1-14", "Stream/Input/Audio", ins=("FL", "FR"), group="loopback-1-14")
+    lb_out = mk("output.loopback-1-14", "Stream/Output/Audio", outs=("FL", "FR"), group="loopback-1-14")
+    jsink = mk("jeeves-mic", "Audio/Sink", ins=("FL", "FR"), outs=("FL", "FR"))
+    jin = mk("input.jeeves-mic-source", "Stream/Input/Audio", ins=("FL", "FR"), group="loopback-1-13")
+    jsrc = mk("jeeves-mic-source", "Audio/Source", outs=("FL", "FR"), group="loopback-1-13")
+    for ch in ("FL", "FR"):
+        pw.link(port(ids["vmic"], "output", ch), port(lb_in, "input", ch))     # WirePlumber: default mic -> loopback
+        pw.link(port(lb_out, "output", ch), port(jsink, "input", ch))
+        pw.link(port(jsink, "output", ch), port(jin, "input", ch))
+    st = core.default_state()
+    cell = core.new_cell(st, "jeeves-mic-source", "mic")
+    for ch in ("FL", "FR"):
+        core.new_link(st, cell["id"], ch, core.HUB_MIC, ch)
+    snap = core.Snapshot(pw.dump())
+    plan = core.compute_plan(st, snap)
+    check(len(plan.loops) == 2 and not any(snap.port_owner.get(i) == ids["vmic"] and snap.port_owner.get(o) == jsrc
+                                           for o, i in plan.desired),
+          "routing the app's source back into the Conduit mic is refused (loop through its loopbacks)")
+    for nid in (lb_in, lb_out, jin, jsrc):
+        pw.nodes[nid]["props"].pop("node.link-group", None)
+    plan = core.compute_plan(st, core.Snapshot(pw.dump()))
+    check(not plan.loops, "(without the modules' link groups there is no visible path -- the groups are what reveal it)")
+
+
 if __name__ == "__main__":
+    test_loop_through_other_apps_loopbacks()
     test_gain_prunes_direct_path()
     test_equaliser()
     test_master_volume_and_cache()
